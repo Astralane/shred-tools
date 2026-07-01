@@ -1,0 +1,1196 @@
+{
+  "title": "Providers monitoring",
+  "uid": "providers-monitoring",
+  "description": "Per-leader provider performance from ClickHouse fec_stats: shred timing (first/decode/last delay vs baseline provider), winrate, invalid/missed/duplicated shreds, unreconstructable FEC sets, pairwise comparison, and database health. Slot->time from slot_timings; leaders from leader_schedule/validators; provider names from the local providers table (seeded from SHRED_PROVIDERS).",
+  "tags": [
+    "shreds-hub",
+    "providers",
+    "clickhouse",
+    "monitoring"
+  ],
+  "schemaVersion": 40,
+  "editable": true,
+  "graphTooltip": 0,
+  "refresh": "",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "fiscalYearStartMonth": 0,
+  "weekStart": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "ClickHouse",
+        "type": "datasource",
+        "query": "grafana-clickhouse-datasource",
+        "current": {
+          "text": "shreds-monitor-clickhouse",
+          "value": "shreds-monitor-clickhouse"
+        },
+        "refresh": 1
+      },
+      {
+        "name": "metric",
+        "label": "Metric",
+        "type": "custom",
+        "query": "First shred : first_ns,Decode : decode_ns,Last shred : last_ns",
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "First shred",
+          "value": "first_ns"
+        },
+        "options": [
+          {
+            "text": "First shred",
+            "value": "first_ns",
+            "selected": true
+          },
+          {
+            "text": "Decode",
+            "value": "decode_ns",
+            "selected": false
+          },
+          {
+            "text": "Last shred",
+            "value": "last_ns",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "provider",
+        "label": "Providers",
+        "description": "Providers to include (default All).",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "provider",
+          "rawSql": "SELECT name FROM (SELECT argMax(name, updated_at) AS name FROM providers GROUP BY id) ORDER BY name",
+          "editorType": "sql",
+          "queryType": "table"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": "'__all__'",
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "leader",
+        "label": "Leaders (name/pubkey)",
+        "description": "Leaders to include (default All).",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "leader",
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT DISTINCT coalesce(nullIf(v.name, ''), ls.leader_pubkey) AS leader FROM leader_schedule ls LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey ORDER BY leader"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": "'__all__'",
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 40,
+      "title": "Provider × leader comparison",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 41,
+      "title": "p50 delay — ${metric:text}",
+      "description": "Median signed delay vs the baseline provider for the selected stage. Rows = leaders, columns = providers. Green = faster (more negative), red = slower. Baseline provider column is ~0.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 75
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, toInt64(quantile(0.5)(${metric})) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 42,
+      "title": "p99 delay — ${metric:text}",
+      "description": "99th-percentile signed delay vs baseline for the selected stage. Green = faster, red = slower.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 75
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, toInt64(quantile(0.99)(${metric})) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 43,
+      "title": "Winrate — ${metric:text}",
+      "description": "Per leader, share of co-observed FEC sets where the provider had the smallest delay for the selected stage. Green = wins more on that leader. Each leader row sums to ~100% across providers.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "continuous-RdYlGr"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 75
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  ),\n  sets AS (\n    SELECT slot, fec_set_index, any(leader) AS leader, argMin(provider, ${metric}) AS winner\n    FROM base WHERE ${metric} IS NOT NULL\n    GROUP BY slot, fec_set_index\n  )\nSELECT leader, winner AS provider, round(count() * 100.0 / sum(count()) OVER (PARTITION BY leader), 1) AS value\nFROM sets GROUP BY leader, winner ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 16,
+      "title": "Winrate per leader",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "panels": []
+    },
+    {
+      "type": "barchart",
+      "id": 17,
+      "title": "Winrate per leader — provider share",
+      "description": "Each leader's bar is the provider mix of first-shred wins; segments sum to 100%.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "options": {
+        "orientation": "auto",
+        "xField": "leader",
+        "stacking": "normal",
+        "showValue": "never",
+        "groupWidth": 0.7,
+        "barWidth": 0.9,
+        "xTickLabelRotation": -90,
+        "xTickLabelSpacing": 0,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "gradientMode": "none",
+            "axisPlacement": "auto"
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  ),\n  sets AS (\n    SELECT slot, fec_set_index, any(leader) AS leader, argMin(provider, first_ns) AS winner\n    FROM base WHERE first_ns IS NOT NULL\n    GROUP BY slot, fec_set_index\n  )\nSELECT leader, winner AS provider,\n       round(count() * 100.0 / sum(count()) OVER (PARTITION BY leader), 2) AS \"winrate\"\nFROM sets GROUP BY leader, winner ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 50,
+      "title": "Shred quality counts",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 51,
+      "title": "Invalid shreds",
+      "description": "Total invalid shreds (failed structural/version/merkle checks). Rows=leaders, cols=providers. Green=fewer, red=more.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 6,
+        "x": 0,
+        "y": 27
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 60
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, sum(invalid_shreds) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 52,
+      "title": "Missed shreds",
+      "description": "Total expected-but-undelivered shreds per FEC set. Green=fewer, red=more.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 6,
+        "x": 6,
+        "y": 27
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 60
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, sum(missed_shreds) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 53,
+      "title": "Invalid FEC sets",
+      "description": "Count of (slot, fec, provider) rows where the FEC set could not be reconstructed/validated. Green=fewer, red=more.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 6,
+        "x": 12,
+        "y": 27
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 60
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, countIf(is_valid = 0) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 54,
+      "title": "Duplicated shreds",
+      "description": "Total duplicated shreds received. Green=fewer, red=more.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 14,
+        "w": 6,
+        "x": 18,
+        "y": 27
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "continuous-GrYlRd"
+          },
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "color-background"
+            },
+            "minWidth": 60
+          },
+          "displayName": "${__field.labels.provider}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "leader"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Leader"
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT leader, provider, sum(duplicated_shreds) AS value\nFROM base GROUP BY leader, provider ORDER BY leader, provider",
+          "queryType": "table",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "provider"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "leader",
+            "mode": "outer"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 23,
+      "title": "Database",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 24,
+      "title": "Storage — ClickHouse data vs disk",
+      "description": "clickhouse_data = size of ClickHouse table data (system.parts). disk_* = the whole filesystem ClickHouse is stored on (includes everything on that disk, not just ClickHouse) — so a high disk_used_pct usually reflects other data on the host, not ClickHouse.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "disk_used_pct"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 75
+                    },
+                    {
+                      "color": "red",
+                      "value": 90
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "clickhouse_data"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "SELECT (SELECT formatReadableSize(sum(bytes_on_disk)) FROM system.parts WHERE active) AS clickhouse_data, formatReadableSize(total_space - free_space) AS disk_used, formatReadableSize(free_space) AS disk_free, formatReadableSize(total_space) AS disk_total, round((total_space - free_space) * 100.0 / total_space, 1) AS disk_used_pct FROM system.disks ORDER BY total_space DESC LIMIT 1",
+          "queryType": "table",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 29,
+      "title": "Pairwise provider comparison",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 30,
+      "title": "Pairwise matrix — A vs B",
+      "description": "Directional comparison over FEC sets observed by BOTH providers. a_winrate_% = share of co-sets where A's first shred beat B's. avg/p50/p99 are stats of (A_first - B_first) ns: negative = A faster.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "a_winrate_%"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 40
+                    },
+                    {
+                      "color": "green",
+                      "value": 50
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "avg_a_minus_b_ns|p50_a_minus_b_ns|p99_a_minus_b_ns"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ns"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "rawSql": "WITH base AS (\n    SELECT\n      coalesce(nullIf(v.name, ''), substring(coalesce(ls.leader_pubkey, 'unknown'), 1, 8)) AS leader,\n      p.name AS provider,\n      f.fec_first_shred_delay_ns AS first_ns,\n      f.fec_decode_delay_ns      AS decode_ns,\n      f.fec_last_shred_delay_ns  AS last_ns,\n      f.invalid_shreds AS invalid_shreds, f.missed_shreds AS missed_shreds, f.duplicated_shreds AS duplicated_shreds, f.is_valid AS is_valid,\n      f.slot AS slot, f.fec_set_index AS fec_set_index\n    FROM fec_stats f\n    INNER JOIN (SELECT slot, min(seen_at) AS seen_at FROM slot_timings GROUP BY slot) st ON st.slot = f.slot\n    LEFT JOIN leader_schedule ls ON ls.slot = f.slot\n    LEFT JOIN validators v ON v.pubkey = ls.leader_pubkey\n    LEFT JOIN (SELECT id, argMax(name, updated_at) AS name FROM providers GROUP BY id) p ON p.id = f.provider_id\n    WHERE $__timeFilter(st.seen_at)\n      AND p.name IS NOT NULL\n      AND ('__all__' IN (${provider:singlequote}) OR p.name IN (${provider:singlequote}))\n      AND ('__all__' IN (${leader:singlequote}) OR coalesce(nullIf(v.name, ''), ls.leader_pubkey) IN (${leader:singlequote}))\n  )\nSELECT a.provider AS provider_a, b.provider AS provider_b,\n       count() AS co_sets,\n       round(countIf(a.first_ns < b.first_ns) * 100.0 / count(), 1) AS \"a_winrate_%\",\n       toInt64(avg(a.first_ns - b.first_ns)) AS \"avg_a_minus_b_ns\",\n       toInt64(quantile(0.5)(a.first_ns - b.first_ns)) AS \"p50_a_minus_b_ns\",\n       toInt64(quantile(0.99)(a.first_ns - b.first_ns)) AS \"p99_a_minus_b_ns\"\nFROM base a\nINNER JOIN base b ON a.slot = b.slot AND a.fec_set_index = b.fec_set_index\nWHERE a.provider < b.provider AND a.first_ns IS NOT NULL AND b.first_ns IS NOT NULL\nGROUP BY provider_a, provider_b\nORDER BY provider_a, provider_b",
+          "queryType": "table",
+          "format": 1
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+target
+.git
+deployment/clickhouse/data
+deployment/clickhouse/logs

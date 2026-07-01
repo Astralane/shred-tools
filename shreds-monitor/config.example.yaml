@@ -1,0 +1,28 @@
+clickhouse:
+  url: "http://localhost:18123"
+  # database: default
+  # user: default
+  # password: default
+  # shred_version: 50093        # optional; skip to accept any version
+  baseline_provider_id: 1       # 0 -> anchor on the earliest-seen provider
+  # fec_grace_ms: 3000
+  # fec_max_wait_slots: 10
+  # flush_interval_ms: 1000
+  # batch_rows: 100000
+  # leader_schedule:
+  #   window_back_secs: 120
+  #   window_forward_secs: 600
+  #   tick_secs: 60
+  #   slot_ms: 400
+
+shred_sources:
+  - name: agave
+    udp_port: 20000
+    provider_id: 1
+    baseline: true
+  - name: jito
+    udp_port: 20001
+    provider_id: 2
+  - name: triton
+    udp_port: 20002
+    provider_id: 3

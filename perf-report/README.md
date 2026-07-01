@@ -8,7 +8,7 @@ xlsx reports (general, per-provider shareable, per-leader, signature-valid).
 
 | script | what it does |
 |---|---|
-| `extract.py` | streams last 24h of `shred_arrivals` → CSVs in `$OUT_DIR`: per-source stats (win rate, delta percentiles vs jito), head-to-head, per-leader splits, own-vs-other slots, 7d daily trend, `shred_first_provider` shares, IP coverage. Optional merry test-hub section (astra vs lucky vs jito). |
+| `extract.py` | streams last 24h of `shred_arrivals` → CSVs in `$OUT_DIR`: per-source stats (win rate, delta percentiles vs jito), head-to-head, per-leader splits, own-vs-other slots, 7d daily trend, `shred_first_provider` shares, IP coverage. Optional test-hub section (per-source comparison). |
 | `build_xlsx.py` | CSVs → `shred_source_performance.xlsx` (general, with daily-trend line charts) + one small sanitized xlsx per provider in `provider_reports/` (only their streams — shareable). |
 | `build_leader_xlsx.py` | CSVs → `per_leader_breakdown.xlsx` with `src_ip` + ASN/datacenter columns (ipinfo.io, cached in `$DATA_DIR/ip_asn.json`). |
 | `sig_valid_panel.py` | per-source stats counting only arrivals whose signature matches jito's for the same (slot, fec_set) — catches sources sending repacked/non-canonical FEC sets. |
@@ -26,8 +26,8 @@ on the tailscale network (e.g. merry-gar).
 
 ```bash
 export SHRED_METRICS_URL="postgresql://<user>:<pass>@rpc:5432/shred_metrics"
-export ASTRALANE_DB_URL="postgresql://<user>:<pass>@client-rpc:5432/astralane_db"
-export MERRY_DB_URL="postgres://postgres:postgres@127.0.0.1:45432/postgres"  # optional, merry only
+export PROVIDERS_DB_URL="postgresql://<user>:<pass>@client-rpc:5432/<providers_db>"
+export MERRY_DB_URL="postgres://postgres:postgres@127.0.0.1:45432/postgres"  # optional, test-hub only
 export DATA_DIR=./data   # CSVs (default)
 export OUT_DIR=./out     # xlsx outputs (default; extract.py writes CSVs to its own OUT_DIR=./data)
 ```
@@ -39,7 +39,7 @@ export OUT_DIR=./out     # xlsx outputs (default; extract.py writes CSVs to its 
 OUT_DIR=./data python3 extract.py
 
 # 2. provider name -> ip map (needed by build_leader_xlsx.py)
-psql "$ASTRALANE_DB_URL" -Atc "SELECT name, src_ip FROM shred_providers" > data/name_ip_map.txt
+psql "$PROVIDERS_DB_URL" -Atc "SELECT name, src_ip FROM shred_providers" > data/name_ip_map.txt
 
 # 3. build spreadsheets
 python3 build_xlsx.py          # general + provider_reports/*.xlsx

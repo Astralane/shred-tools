@@ -1,0 +1,25 @@
+[package]
+name = "shreds-monitor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+solana-ledger = { version = "4.1", features = ["agave-unstable-api"] }
+solana-sdk = "4.0"
+solana-signature = { version = "3.4", features = ["verify"] }
+clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
+arc-swap = "1.7"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "signal", "time"] }
+tokio-util = "0.7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "shreds-monitor"
+path = "src/main.rs"

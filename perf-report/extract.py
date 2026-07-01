@@ -12,9 +12,9 @@ same hub for the same FEC set; negative = earlier than jito.
 
 Environment:
   SHRED_METRICS_URL  required  postgres URL of the shred_metrics DB
-  ASTRALANE_DB_URL   required  postgres URL of astralane_db (shred_providers)
-  MERRY_DB_URL       optional  postgres URL of the merry test-hub DB;
-                               enables the astra-vs-lucky-vs-jito section
+  PROVIDERS_DB_URL   required  postgres URL of the providers DB (shred_providers)
+  MERRY_DB_URL       optional  postgres URL of the test-hub DB;
+                               enables the per-source test-hub section
   RPC_URL            optional  Solana RPC (default mainnet-beta)
   OUT_DIR            optional  output dir for CSVs (default ./data)
   WINDOW_HOURS       optional  main analysis window (default 24)
@@ -33,7 +33,7 @@ import psycopg
 import requests
 
 SM = os.environ["SHRED_METRICS_URL"]
-AS = os.environ["ASTRALANE_DB_URL"]
+AS = os.environ["PROVIDERS_DB_URL"]
 MERRY = os.environ.get("MERRY_DB_URL")
 RPC = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 OUT_DIR = os.environ.get("OUT_DIR", "./data")
@@ -228,7 +228,7 @@ def write_h2h_csv(path, h2h, h2h_n):
 
 
 def merry_stats():
-    """astra vs lucky vs jito (and the rest) on the merry-gar test hub."""
+    """Per-source comparison on the merry-gar test hub."""
     hub = "merry-gar"
     conn = psycopg.connect(MERRY)
     overall = defaultdict(SrcStats)

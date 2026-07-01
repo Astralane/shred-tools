@@ -296,9 +296,8 @@ def readme(wb, meta):
         ("HUBS", ""),
         ("198.13.138.175", "terra-1 (FRA prod hub)"),
         ("64.130.37.201", "NY hub"),
-        ("merry-gar", "test hub on merry-gar (88.216.36.99): astra vs lucky "
-                      "vs jito vs everstake comparison; 'astra' = our own "
-                      "source; delta baseline = jito on that hub"),
+        ("merry-gar", "test hub on merry-gar (88.216.36.99): per-source "
+                      "comparison; delta baseline = jito on that hub"),
         ("", ""),
         ("CAVEATS", ""),
         ("sampling", "competition records 1-in-N FEC sets; stats are over "
@@ -329,7 +328,7 @@ def main():
     add_csv_sheet(wb, "per_source_24h", f"{SRC}/per_source_24h.csv")
     h2h_matrices(wb)
     if os.path.exists(f"{SRC}/merry_per_source_24h.csv"):
-        add_csv_sheet(wb, "astra vs lucky vs jito (merry)",
+        add_csv_sheet(wb, "test hub per-source (merry)",
                       f"{SRC}/merry_per_source_24h.csv")
         h2h_matrices(wb, "merry_h2h_24h.csv")
     add_csv_sheet(wb, "leader_slots_24h", f"{SRC}/leader_slots_24h.csv")

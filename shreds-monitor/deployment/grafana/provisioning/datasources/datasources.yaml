@@ -1,0 +1,20 @@
+# ClickHouse datasource for the shreds-monitor stack. Points at the compose
+# `clickhouse` service over the native protocol. The uid matches the
+# providers-monitoring dashboard's default datasource variable.
+apiVersion: 1
+
+datasources:
+  - name: shreds-monitor-clickhouse
+    uid: shreds-monitor-clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      secure: false
+      username: default
+      defaultDatabase: default
+    secureJsonData:
+      password: default

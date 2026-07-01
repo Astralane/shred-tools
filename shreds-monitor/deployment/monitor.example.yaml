@@ -1,0 +1,20 @@
+clickhouse:
+  # Host-network monitor reaches ClickHouse via the host-published port.
+  url: "http://localhost:18123"
+  # database: default
+  # user: default
+  # password: default
+  # shred_version: 50093
+  baseline_provider_id: 1
+
+shred_sources:
+  - name: agave
+    udp_port: 20000
+    provider_id: 1
+    baseline: true
+  - name: jito
+    udp_port: 20001
+    provider_id: 2
+  - name: triton
+    udp_port: 20002
+    provider_id: 3

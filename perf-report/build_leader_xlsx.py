@@ -6,7 +6,7 @@ Inputs in DATA_DIR:
   leader_slots_24h.csv  from extract.py
   meta.json             from extract.py
   name_ip_map.txt       "name|src_ip" lines, dump of shred_providers:
-                        psql "$ASTRALANE_DB_URL" -Atc \
+                        psql "$PROVIDERS_DB_URL" -Atc \
                           "SELECT name, src_ip FROM shred_providers" \
                           > $DATA_DIR/name_ip_map.txt
   ip_asn.json           lookup cache (created/updated automatically)
