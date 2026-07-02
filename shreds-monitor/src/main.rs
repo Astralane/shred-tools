@@ -2,6 +2,7 @@ mod clickhouse;
 mod config;
 mod fec_stats;
 mod leader_schedule;
+mod metrics;
 mod receiver;
 
 use std::{
@@ -15,6 +16,7 @@ use clap::Parser;
 use config::Config;
 use fec_stats::{FecShred, FecStatsParams};
 use leader_schedule::LeaderSchedule;
+use metrics::Metrics;
 use receiver::{ShredPacket, UdpReceiver};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +46,11 @@ async fn main() -> Result<()> {
     let current_slot = Arc::new(AtomicU64::new(0));
     let schedule = LeaderSchedule::new();
 
+    let metrics = Metrics::new(&cfg.provider_rows(), Arc::clone(&current_slot));
+    if cfg.metrics_port != 0 {
+        Arc::clone(&metrics).serve(cfg.metrics_port);
+    }
+
     let client = clickhouse::create_clickhouse_client(&cfg.clickhouse);
     if let Err(e) = fec_stats::upsert_providers(&client, &cfg.provider_rows()).await {
         tracing::warn!(error = %e, "failed to upsert providers table (dashboard names may be missing)");
@@ -67,6 +74,7 @@ async fn main() -> Result<()> {
         fec_max_wait_slots: cfg.clickhouse.fec_max_wait_slots,
         flush_interval_ms: cfg.clickhouse.flush_interval_ms,
         batch_rows: cfg.clickhouse.batch_rows,
+        metrics: Arc::clone(&metrics),
     };
     let fec_handle = tokio::spawn(fec_stats::run(
         params,
@@ -90,14 +98,20 @@ async fn main() -> Result<()> {
 
         let fec_tx = fec_tx.clone();
         let provider_id = source.provider_id;
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             while let Some(pkt) = rx.recv().await {
+                if let Some(p) = metrics.provider(provider_id) {
+                    p.received.inc();
+                }
                 let msg = FecShred {
                     provider_id,
                     rx: pkt.received_at,
                     shred: Bytes::from(pkt.data),
                 };
-                let _ = fec_tx.try_send(msg);
+                if fec_tx.try_send(msg).is_err() {
+                    metrics.fec_channel_full.inc();
+                }
             }
         });
     }

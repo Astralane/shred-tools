@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::leader_schedule::LeaderSchedule;
+use crate::{leader_schedule::LeaderSchedule, metrics::Metrics};
 
 const CODING_HEADER_LEN: usize = 89;
 const VARIANT_OFFSET: usize = 64;
@@ -51,6 +51,7 @@ pub struct FecStatsParams {
     pub fec_max_wait_slots: u64,
     pub flush_interval_ms: u64,
     pub batch_rows: usize,
+    pub metrics: Arc<Metrics>,
 }
 
 #[derive(Default)]
@@ -189,12 +190,20 @@ where
 
 /// Like [`write_rows`], but for background flushes: logs failures instead of
 /// returning them.
-async fn write_rows_logged<R>(client: &clickhouse::Client, table: &str, rows: Vec<R>)
-where
+async fn write_rows_logged<R>(
+    client: &clickhouse::Client,
+    table: &str,
+    rows: Vec<R>,
+    metrics: &Metrics,
+) where
     R: clickhouse::RowOwned + clickhouse::RowWrite,
 {
-    if let Err(e) = write_rows(client, table, &rows).await {
-        warn!(error = %e, rows = rows.len(), table, "fec_stats: clickhouse write failed");
+    match write_rows(client, table, &rows).await {
+        Ok(()) => metrics.record_rows_written(table, rows.len() as u64),
+        Err(e) => {
+            metrics.record_write_error(table);
+            warn!(error = %e, rows = rows.len(), table, "fec_stats: clickhouse write failed");
+        }
     }
 }
 
@@ -354,10 +363,16 @@ impl Monitor {
 
         if !e.seen.insert(h) {
             e.duplicate += 1;
+            if let Some(p) = self.params.metrics.provider(item.provider_id) {
+                p.duplicate.inc();
+            }
             return;
         }
         if !structural {
             e.invalid += 1;
+            if let Some(p) = self.params.metrics.provider(item.provider_id) {
+                p.invalid.inc();
+            }
             return;
         }
 
@@ -407,7 +422,7 @@ impl Monitor {
         let baseline_id = self.params.baseline_provider_id;
         for key in ready {
             if let Some(set) = self.sets.remove(&key) {
-                finalize_set(key, set, baseline_id, &mut self.out);
+                finalize_set(key, set, baseline_id, &mut self.out, &self.params.metrics);
             }
         }
     }
@@ -426,11 +441,18 @@ impl Monitor {
             return;
         }
         let rows = std::mem::take(&mut self.out);
-        write_rows_logged(&self.params.client, &self.params.table, rows).await;
+        write_rows_logged(&self.params.client, &self.params.table, rows, &self.params.metrics)
+            .await;
     }
 }
 
-fn finalize_set(key: (u64, u32), set: FecSet, baseline_id: u32, out: &mut Vec<Row>) {
+fn finalize_set(
+    key: (u64, u32),
+    set: FecSet,
+    baseline_id: u32,
+    out: &mut Vec<Row>,
+    metrics: &Metrics,
+) {
     let (slot, fec) = key;
     let expected_total = match (set.num_data, set.num_coding) {
         (Some(d), Some(c)) => Some(d as u32 + c as u32),
@@ -453,7 +475,21 @@ fn finalize_set(key: (u64, u32), set: FecSet, baseline_id: u32, out: &mut Vec<Ro
         .and_then(|b| b.last)
         .or_else(|| earliest(set.providers.values().filter_map(|p| p.last)));
 
+    let winner = set
+        .providers
+        .iter()
+        .filter_map(|(id, e)| e.first.map(|t| (*id, t)))
+        .min_by_key(|(_, t)| *t)
+        .map(|(id, _)| id);
+    if let Some(p) = winner.and_then(|id| metrics.provider(id)) {
+        p.fec_sets_won.inc();
+    }
+
     for (provider_id, e) in set.providers.iter() {
+        if let (Some(first), Some(p)) = (e.first, metrics.provider(*provider_id)) {
+            p.first_shred_delay_ns
+                .observe(signed_delta(first, anchor_first) as f64);
+        }
         let delivered = e.delivered();
         let exp = expected_total.unwrap_or(delivered);
         let missed = exp.saturating_sub(delivered);
@@ -487,9 +523,10 @@ impl Monitor {
         };
         let client = self.params.client.clone();
         let table = self.params.table.clone();
+        let metrics = Arc::clone(&self.params.metrics);
         tokio::spawn(async move {
             let _permit = permit;
-            write_rows_logged(&client, &table, rows).await;
+            write_rows_logged(&client, &table, rows, &metrics).await;
         });
     }
 
@@ -517,9 +554,10 @@ impl Monitor {
             Err(_) => return,
         };
         let client = self.params.client.clone();
+        let metrics = Arc::clone(&self.params.metrics);
         tokio::spawn(async move {
             let _permit = permit;
-            write_rows_logged(&client, SLOT_TIMINGS_TABLE, rows).await;
+            write_rows_logged(&client, SLOT_TIMINGS_TABLE, rows, &metrics).await;
         });
     }
 }

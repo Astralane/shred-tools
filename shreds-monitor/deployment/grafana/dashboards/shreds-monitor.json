@@ -1,7 +1,7 @@
 {
   "title": "Shreds monitor",
   "uid": "shreds-monitor",
-  "description": "Health, throughput and latency of the shreds instance scraped by the stack's Prometheus (see deployment/prometheus/prometheus.yaml).",
+  "description": "Health of the shreds-monitor instance: provider throughput, win share and first-shred delay vs the baseline provider, drops, and ClickHouse writes. Scraped by the stack's Prometheus on host port 19091.",
   "tags": [
     "shreds-monitor"
   ],
@@ -183,9 +183,9 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "shreds_hub_build_info",
+          "expr": "shreds_monitor_build_info",
           "instant": true,
-          "legendFormat": "{{commit}} \u00b7 {{build_time}}",
+          "legendFormat": "v{{version}}",
           "refId": "A"
         }
       ],
@@ -197,7 +197,7 @@
         "type": "prometheus",
         "uid": "shreds-monitor-prometheus"
       },
-      "description": "Hub ingest mode from shreds_hub_runtime_info.",
+      "description": "Number of configured shred providers reporting.",
       "fieldConfig": {
         "defaults": {
           "mappings": [],
@@ -215,7 +215,7 @@
       },
       "gridPos": {
         "h": 2,
-        "w": 2,
+        "w": 6,
         "x": 18,
         "y": 3
       },
@@ -232,129 +232,19 @@
           "fields": "",
           "values": false
         },
-        "textMode": "name",
+        "textMode": "value",
         "wideLayout": true
       },
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "shreds_hub_runtime_info",
+          "expr": "count(shreds_monitor_shreds_received_total)",
           "instant": true,
-          "legendFormat": "{{ingest_mode}}",
+          "legendFormat": "providers",
           "refId": "A"
         }
       ],
-      "title": "Ingest",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "shreds-monitor-prometheus"
-      },
-      "description": "Hub forward mode from shreds_hub_runtime_info. For mode=xdp/udp the forwarder is implicit; for mode=af_packet it reflects af_packet.forwarder.",
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "purple",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 2,
-        "w": 2,
-        "x": 20,
-        "y": 3
-      },
-      "id": 111,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "name",
-        "wideLayout": true
-      },
-      "pluginVersion": "11.3.1",
-      "targets": [
-        {
-          "expr": "shreds_hub_runtime_info",
-          "instant": true,
-          "legendFormat": "{{forward_mode}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Forward",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "shreds-monitor-prometheus"
-      },
-      "description": "Hub metrics collection mode. off=hot-path disabled, minimal=default, full=per-stage latency + Missed.",
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 2,
-        "w": 2,
-        "x": 22,
-        "y": 3
-      },
-      "id": 1,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "name",
-        "wideLayout": true
-      },
-      "pluginVersion": "11.3.1",
-      "targets": [
-        {
-          "expr": "shreds_hub_runtime_info",
-          "instant": true,
-          "legendFormat": "{{metrics_mode}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Metrics",
+      "title": "Providers",
       "type": "stat"
     },
     {
@@ -472,7 +362,7 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "shreds_hub_uptime_seconds",
+          "expr": "shreds_monitor_uptime_seconds",
           "instant": true,
           "legendFormat": "uptime",
           "refId": "A"
@@ -529,7 +419,7 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "max_over_time(shreds_hub_last_seen_slot[$__range])",
+          "expr": "max_over_time(shreds_monitor_last_seen_slot[$__range])",
           "instant": true,
           "legendFormat": "up",
           "refId": "A"
@@ -635,12 +525,12 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "sum by (source) (rate(shreds_hub_packets_received_total[$__rate_interval]))",
-          "legendFormat": "{{source}}",
+          "expr": "sum by (provider) (rate(shreds_monitor_shreds_received_total[$__rate_interval]))",
+          "legendFormat": "{{provider}}",
           "refId": "A"
         }
       ],
-      "title": "Shreds received per source",
+      "title": "Shreds received per provider",
       "type": "timeseries"
     },
     {
@@ -648,7 +538,7 @@
         "type": "prometheus",
         "uid": "shreds-monitor-prometheus"
       },
-      "description": "Packets the instance had to drop or stall on. A healthy instance shows all series at zero.",
+      "description": "Invalid/duplicate shreds per provider, shreds dropped on a full processing channel, and failed ClickHouse writes. All zero when healthy.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -728,32 +618,27 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "sum(rate(shreds_hub_source_unmatched_dropped_total[$__rate_interval]))",
-          "legendFormat": "unknown source ip",
+          "expr": "sum by (provider) (rate(shreds_monitor_shreds_invalid_total[$__rate_interval]))",
+          "legendFormat": "invalid \u00b7 {{provider}}",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(shreds_hub_source_tier_unknown_dropped_total[$__rate_interval]))",
-          "legendFormat": "source tier unknown",
+          "expr": "sum by (provider) (rate(shreds_monitor_shreds_duplicate_total[$__rate_interval]))",
+          "legendFormat": "duplicate \u00b7 {{provider}}",
           "refId": "B"
         },
         {
-          "expr": "sum(rate(shreds_hub_rx_to_ingestor_full_total[$__rate_interval]))",
-          "legendFormat": "rx\u2192ingestor channel full",
+          "expr": "rate(shreds_monitor_fec_channel_full_total[$__rate_interval])",
+          "legendFormat": "processing channel full",
           "refId": "C"
         },
         {
-          "expr": "sum(rate(shreds_hub_ingestor_to_tx_full_total[$__rate_interval]))",
-          "legendFormat": "ingestor\u2192tx channel full",
+          "expr": "sum by (table) (rate(shreds_monitor_clickhouse_write_errors_total[$__rate_interval]))",
+          "legendFormat": "write errors \u00b7 {{table}}",
           "refId": "D"
-        },
-        {
-          "expr": "sum(rate(shreds_hub_xdp_rx_fill_starved_total[$__rate_interval]))",
-          "legendFormat": "xdp fill ring starved",
-          "refId": "E"
         }
       ],
-      "title": "Dropped packets by reason",
+      "title": "Drops & errors",
       "type": "timeseries"
     },
     {
@@ -761,7 +646,7 @@
         "type": "prometheus",
         "uid": "shreds-monitor-prometheus"
       },
-      "description": "Share of first-delivery (unique) shreds by source. Sums to 1.0 across sources.",
+      "description": "Share of FEC sets where this provider delivered the first shred.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -842,12 +727,12 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "(sum by (source) (rate(shreds_hub_packets_deduped_total[$__rate_interval])) / ignoring(source) group_left sum (rate(shreds_hub_packets_deduped_total[$__rate_interval]))) and on (source) (sum by (source) (rate(shreds_hub_packets_received_total[$__rate_interval])) > 0)",
-          "legendFormat": "{{source}}",
+          "expr": "sum by (provider) (rate(shreds_monitor_fec_sets_won_total[$__rate_interval])) / ignoring(provider) group_left sum(rate(shreds_monitor_fec_sets_won_total[$__rate_interval]))",
+          "legendFormat": "{{provider}}",
           "refId": "A"
         }
       ],
-      "title": "Win share per source",
+      "title": "Win share per provider",
       "type": "timeseries"
     },
     {
@@ -934,14 +819,14 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "sum by (listener) (rate(shreds_hub_packets_forwarded_total[$__rate_interval]))",
-          "legendFormat": "{{listener}}",
+          "expr": "sum by (table) (rate(shreds_monitor_clickhouse_rows_written_total[$__rate_interval]))",
+          "legendFormat": "{{table}}",
           "refId": "A"
         }
       ],
-      "title": "Shreds forwarded per listener",
+      "title": "Rows written to ClickHouse",
       "type": "timeseries",
-      "description": "Fan-out rate to each subscribed listener (ip:port)."
+      "description": "Successful insert rate per table (fec_stats, slot_timings)."
     },
     {
       "collapsed": false,
@@ -953,7 +838,7 @@
       },
       "id": 400,
       "panels": [],
-      "title": "Source comparison",
+      "title": "Provider comparison",
       "type": "row"
     },
     {
@@ -961,7 +846,7 @@
         "type": "prometheus",
         "uid": "shreds-monitor-prometheus"
       },
-      "description": "Mean delay vs winner when this source loses. Ingestor-side observation, so the consistently-fastest source's line is empty \u2014 pair with Win rate.",
+      "description": "Negative = ahead of the baseline provider. Delays land in \u00b1100ms histogram buckets, so extreme quantiles saturate at the edges.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1040,12 +925,12 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "(sum by (source) (rate(shreds_hub_source_delay_ns_sum[$__rate_interval])) / sum by (source) (rate(shreds_hub_source_delay_ns_count[$__rate_interval]))) and on (source) (sum by (source) (rate(shreds_hub_packets_received_total[$__rate_interval])) > 0)",
-          "legendFormat": "{{source}}",
+          "expr": "sum by (provider) (rate(shreds_monitor_first_shred_delay_ns_sum[$__rate_interval])) / sum by (provider) (rate(shreds_monitor_first_shred_delay_ns_count[$__rate_interval]))",
+          "legendFormat": "{{provider}}",
           "refId": "A"
         }
       ],
-      "title": "Source delay \u2014 avg",
+      "title": "First-shred delay vs baseline \u2014 avg",
       "type": "timeseries"
     },
     {
@@ -1131,13 +1016,14 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (source, le) (rate(shreds_hub_source_delay_ns_bucket[$__rate_interval]))) and on (source) (sum by (source) (rate(shreds_hub_packets_received_total[$__rate_interval])) > 0)",
-          "legendFormat": "{{source}}",
+          "expr": "histogram_quantile(0.5, sum by (provider, le) (rate(shreds_monitor_first_shred_delay_ns_bucket[$__rate_interval])))",
+          "legendFormat": "{{provider}}",
           "refId": "A"
         }
       ],
-      "title": "Source delay \u2014 p50",
-      "type": "timeseries"
+      "title": "First-shred delay vs baseline \u2014 p50",
+      "type": "timeseries",
+      "description": "Negative = ahead of the baseline provider. Delays land in \u00b1100ms histogram buckets, so extreme quantiles saturate at the edges."
     },
     {
       "datasource": {
@@ -1222,20 +1108,21 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (source, le) (rate(shreds_hub_source_delay_ns_bucket[$__rate_interval]))) and on (source) (sum by (source) (rate(shreds_hub_packets_received_total[$__rate_interval])) > 0)",
-          "legendFormat": "{{source}}",
+          "expr": "histogram_quantile(0.95, sum by (provider, le) (rate(shreds_monitor_first_shred_delay_ns_bucket[$__rate_interval])))",
+          "legendFormat": "{{provider}}",
           "refId": "A"
         }
       ],
-      "title": "Source delay \u2014 p95",
-      "type": "timeseries"
+      "title": "First-shred delay vs baseline \u2014 p95",
+      "type": "timeseries",
+      "description": "Negative = ahead of the baseline provider. Delays land in \u00b1100ms histogram buckets, so extreme quantiles saturate at the edges."
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "shreds-monitor-prometheus"
       },
-      "description": "One row per source over the selected range. Wins = shreds where this source arrived first (won dedup).",
+      "description": "One row per provider over the selected range. Wins = FEC sets where this provider delivered the first shred; delay is vs the baseline provider.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -1264,7 +1151,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "source"
+              "options": "provider"
             },
             "properties": [
               {
@@ -1355,47 +1242,47 @@
       "pluginVersion": "11.3.1",
       "targets": [
         {
-          "expr": "sum by (source) (increase(shreds_hub_packets_received_total[$__range])) > 0",
+          "expr": "sum by (provider) (increase(shreds_monitor_shreds_received_total[$__range])) > 0",
           "format": "table",
           "instant": true,
-          "legendFormat": "Total",
+          "legendFormat": "Received",
           "refId": "Total"
         },
         {
-          "expr": "sum by (source) (increase(shreds_hub_packets_deduped_total[$__range])) and on (source) (sum by (source) (increase(shreds_hub_packets_received_total[$__range])) > 0)",
+          "expr": "sum by (provider) (increase(shreds_monitor_fec_sets_won_total[$__range]))",
           "format": "table",
           "instant": true,
-          "legendFormat": "First",
+          "legendFormat": "Wins",
           "refId": "First"
         },
         {
-          "expr": "100 * (sum by (source) (increase(shreds_hub_packets_deduped_total[$__range])) / ignoring(source) group_left sum (increase(shreds_hub_packets_deduped_total[$__range]))) and on (source) (sum by (source) (increase(shreds_hub_packets_received_total[$__range])) > 0)",
+          "expr": "100 * sum by (provider) (increase(shreds_monitor_fec_sets_won_total[$__range])) / ignoring(provider) group_left sum(increase(shreds_monitor_fec_sets_won_total[$__range]))",
           "format": "table",
           "instant": true,
           "legendFormat": "Win %",
           "refId": "FirstPct"
         },
         {
-          "expr": "((sum by (source) (rate(shreds_hub_source_delay_ns_sum[$__range])) / sum by (source) (rate(shreds_hub_source_delay_ns_count[$__range]))) / 1000) and on (source) (sum by (source) (increase(shreds_hub_packets_received_total[$__range])) > 0)",
+          "expr": "(sum by (provider) (rate(shreds_monitor_first_shred_delay_ns_sum[$__range])) / sum by (provider) (rate(shreds_monitor_first_shred_delay_ns_count[$__range]))) / 1000",
           "format": "table",
           "instant": true,
-          "legendFormat": "Avg",
+          "legendFormat": "Avg delay",
           "refId": "AvgLag"
         },
         {
-          "expr": "(histogram_quantile(0.5, sum by (source, le) (rate(shreds_hub_source_delay_ns_bucket[$__range]))) / 1000) and on (source) (sum by (source) (increase(shreds_hub_packets_received_total[$__range])) > 0)",
+          "expr": "histogram_quantile(0.5, sum by (provider, le) (rate(shreds_monitor_first_shred_delay_ns_bucket[$__range]))) / 1000",
           "format": "table",
           "instant": true,
-          "legendFormat": "Med",
+          "legendFormat": "Median delay",
           "refId": "MedLag"
         }
       ],
-      "title": "Source summary",
+      "title": "Provider summary",
       "transformations": [
         {
           "id": "joinByField",
           "options": {
-            "byField": "source",
+            "byField": "provider",
             "mode": "outer"
           }
         },
@@ -1410,7 +1297,7 @@
               "Time 5": true
             },
             "indexByName": {
-              "source": 0,
+              "provider": 0,
               "Value #Total": 1,
               "Value #First": 2,
               "Value #FirstPct": 3,
@@ -1428,313 +1315,6 @@
         }
       ],
       "type": "table"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 42
-      },
-      "id": 500,
-      "panels": [],
-      "title": "Instance latency",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "shreds-monitor-prometheus"
-      },
-      "description": "avg, p50, p95, p99 of userspace latency t4\u2212t0. Populated when metrics_mode \u2265 minimal.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "ns"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 43
-      },
-      "id": 501,
-      "maxDataPoints": 120,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.3.1",
-      "targets": [
-        {
-          "expr": "sum(rate(shreds_hub_latency_total_ns_sum[$__rate_interval])) / sum(rate(shreds_hub_latency_total_ns_count[$__rate_interval]))",
-          "legendFormat": "avg",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(shreds_hub_latency_total_ns_bucket[$__rate_interval])))",
-          "legendFormat": "p50",
-          "refId": "B"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(shreds_hub_latency_total_ns_bucket[$__rate_interval])))",
-          "legendFormat": "p95",
-          "refId": "C"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(shreds_hub_latency_total_ns_bucket[$__rate_interval])))",
-          "legendFormat": "p99",
-          "refId": "D"
-        }
-      ],
-      "title": "End-to-end latency (rx \u2192 forward)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "shreds-monitor-prometheus"
-      },
-      "description": "Where time is spent inside the instance: NIC\u2192userspace ingress, full rx\u2192forward path, TX send, and TX backpressure waits.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 40,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "ns"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 43
-      },
-      "id": 504,
-      "maxDataPoints": 120,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.3.1",
-      "targets": [
-        {
-          "expr": "sum(rate(shreds_hub_latency_rx_ingress_ns_sum[$__rate_interval])) / sum(rate(shreds_hub_latency_rx_ingress_ns_count[$__rate_interval]))",
-          "legendFormat": "rx ingress",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(shreds_hub_latency_total_ns_sum[$__rate_interval])) / sum(rate(shreds_hub_latency_total_ns_count[$__rate_interval]))",
-          "legendFormat": "end-to-end",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(shreds_hub_latency_tx_total_ns_sum[$__rate_interval])) / sum(rate(shreds_hub_latency_tx_total_ns_count[$__rate_interval]))",
-          "legendFormat": "tx",
-          "refId": "C"
-        },
-        {
-          "expr": "sum(rate(shreds_hub_tx_backpressure_wait_ns_sum[$__rate_interval])) / sum(rate(shreds_hub_tx_backpressure_wait_ns_count[$__rate_interval]))",
-          "legendFormat": "tx backpressure wait",
-          "refId": "D"
-        }
-      ],
-      "title": "Average latency by stage",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "shreds-monitor-prometheus"
-      },
-      "description": "Populated when metrics_mode \u2265 minimal. Shows full distribution shape, not just quantile lines.",
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "scaleDistribution": {
-              "log": 10,
-              "type": "log"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 43
-      },
-      "id": 502,
-      "maxDataPoints": 120,
-      "options": {
-        "calculate": false,
-        "cellGap": 1,
-        "color": {
-          "exponent": 0.5,
-          "fill": "dark-orange",
-          "mode": "scheme",
-          "reverse": false,
-          "scale": "exponential",
-          "scheme": "Spectral",
-          "steps": 64
-        },
-        "exemplars": {
-          "color": "rgba(255,0,255,0.7)"
-        },
-        "filterValues": {
-          "le": "1e-09"
-        },
-        "legend": {
-          "show": true
-        },
-        "rowsFrame": {
-          "layout": "auto"
-        },
-        "tooltip": {
-          "mode": "single",
-          "showColorScale": false,
-          "yHistogram": false
-        },
-        "yAxis": {
-          "axisPlacement": "left",
-          "decimals": 0,
-          "reverse": false,
-          "unit": "ns"
-        }
-      },
-      "pluginVersion": "11.3.1",
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum by (le) (rate(shreds_hub_latency_total_ns_bucket[$__rate_interval]))",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Latency distribution",
-      "type": "heatmap"
     }
   ]
 }

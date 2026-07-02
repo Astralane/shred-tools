@@ -9,6 +9,14 @@ use crate::leader_schedule::LeaderScheduleConfig;
 pub struct Config {
     pub clickhouse: ClickhouseConfig,
     pub shred_sources: Vec<ShredSourceConfig>,
+    /// Prometheus /metrics port; 0 disables the endpoint. The default matches
+    /// the deployment stack's hardcoded scrape target.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+}
+
+fn default_metrics_port() -> u16 {
+    19091
 }
 
 #[derive(Deserialize)]
