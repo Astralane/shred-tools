@@ -1,7 +1,8 @@
 # shreds-monitor — self-sufficient stack
 
-One `docker compose up` brings up ClickHouse, a leader-schedule populator, Grafana
-(auto-loading the **Providers monitoring** dashboard), and the monitor itself.
+One `docker compose up` brings up ClickHouse, a leader-schedule populator,
+Prometheus, Grafana (auto-loading the **Providers monitoring** and
+**Shreds monitor** dashboards), and the monitor itself.
 
 ## Quick start
 
@@ -22,7 +23,8 @@ Open Grafana at <http://localhost:3000> → **Providers monitoring**.
 |-------------------|-------------------------------------------------------------------|------------------|
 | `clickhouse`      | Analytics store; schema auto-applied from `clickhouse/init`        | 18123 / 19000    |
 | `leader-schedule` | Fills `leader_schedule` + `validators` from RPC (once, then daily) | —                |
-| `grafana`         | Provisioned ClickHouse datasource + dashboard                      | 3000             |
+| `prometheus`      | Scrapes instance metrics for the **Shreds monitor** dashboard      | 19090            |
+| `grafana`         | Provisioned ClickHouse + Prometheus datasources and dashboards     | 3000             |
 | `shreds-monitor`  | Ingests shreds (host network), writes `fec_stats` + `slot_timings` | UDP per provider |
 
 ## Configuration

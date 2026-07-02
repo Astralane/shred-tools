@@ -40,6 +40,17 @@ services:
       - ./leader-schedule/populate_leader_schedule.py:/app/populate_leader_schedule.py:ro
     command: ["sh", "-c", "while true; do echo 'populating leader schedule...'; python /app/populate_leader_schedule.py || echo 'populate failed'; sleep 86400; done"]
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: shreds-monitor-prometheus
+    ports:
+      - "19090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - prom-data:/prometheus
+      - ./prometheus/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+
   grafana:
     image: grafana/grafana:latest
     container_name: shreds-monitor-grafana
@@ -78,3 +89,4 @@ services:
 volumes:
   ch-data:
   grafana-data:
+  prom-data:

@@ -3,7 +3,6 @@
   "uid": "providers-monitoring",
   "description": "Per-leader provider performance from ClickHouse fec_stats: shred timing (first/decode/last delay vs baseline provider), winrate, invalid/missed/duplicated shreds, unreconstructable FEC sets, pairwise comparison, and database health. Slot->time from slot_timings; leaders from leader_schedule/validators; provider names from the local providers table (seeded from SHRED_PROVIDERS).",
   "tags": [
-    "shreds-hub",
     "providers",
     "clickhouse",
     "monitoring"
@@ -137,7 +136,7 @@
     {
       "type": "row",
       "id": 40,
-      "title": "Provider × leader comparison",
+      "title": "Provider \u00d7 leader comparison",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -150,7 +149,7 @@
     {
       "type": "table",
       "id": 41,
-      "title": "p50 delay — ${metric:text}",
+      "title": "p50 delay \u2014 ${metric:text}",
       "description": "Median signed delay vs the baseline provider for the selected stage. Rows = leaders, columns = providers. Green = faster (more negative), red = slower. Baseline provider column is ~0.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
@@ -251,7 +250,7 @@
     {
       "type": "table",
       "id": 42,
-      "title": "p99 delay — ${metric:text}",
+      "title": "p99 delay \u2014 ${metric:text}",
       "description": "99th-percentile signed delay vs baseline for the selected stage. Green = faster, red = slower.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
@@ -352,7 +351,7 @@
     {
       "type": "table",
       "id": 43,
-      "title": "Winrate — ${metric:text}",
+      "title": "Winrate \u2014 ${metric:text}",
       "description": "Per leader, share of co-observed FEC sets where the provider had the smallest delay for the selected stage. Green = wins more on that leader. Each leader row sums to ~100% across providers.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
@@ -466,7 +465,7 @@
     {
       "type": "barchart",
       "id": 17,
-      "title": "Winrate per leader — provider share",
+      "title": "Winrate per leader \u2014 provider share",
       "description": "Each leader's bar is the provider mix of first-shred wins; segments sum to 100%.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
@@ -976,8 +975,8 @@
     {
       "type": "table",
       "id": 24,
-      "title": "Storage — ClickHouse data vs disk",
-      "description": "clickhouse_data = size of ClickHouse table data (system.parts). disk_* = the whole filesystem ClickHouse is stored on (includes everything on that disk, not just ClickHouse) — so a high disk_used_pct usually reflects other data on the host, not ClickHouse.",
+      "title": "Storage \u2014 ClickHouse data vs disk",
+      "description": "clickhouse_data = size of ClickHouse table data (system.parts). disk_* = the whole filesystem ClickHouse is stored on (includes everything on that disk, not just ClickHouse) \u2014 so a high disk_used_pct usually reflects other data on the host, not ClickHouse.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "${datasource}"
@@ -1092,7 +1091,7 @@
     {
       "type": "table",
       "id": 30,
-      "title": "Pairwise matrix — A vs B",
+      "title": "Pairwise matrix \u2014 A vs B",
       "description": "Directional comparison over FEC sets observed by BOTH providers. a_winrate_% = share of co-sets where A's first shred beat B's. avg/p50/p99 are stats of (A_first - B_first) ns: negative = A faster.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",

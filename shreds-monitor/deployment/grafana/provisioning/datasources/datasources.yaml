@@ -1,9 +1,16 @@
-# ClickHouse datasource for the shreds-monitor stack. Points at the compose
-# `clickhouse` service over the native protocol. The uid matches the
-# providers-monitoring dashboard's default datasource variable.
+# Datasources for the shreds-monitor stack. ClickHouse backs the
+# providers-monitoring dashboard (uid matches its datasource variable);
+# Prometheus backs the shreds-monitor dashboard and points at the compose
+# `prometheus` service.
 apiVersion: 1
 
 datasources:
+  - name: shreds-monitor-prometheus
+    uid: shreds-monitor-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+
   - name: shreds-monitor-clickhouse
     uid: shreds-monitor-clickhouse
     type: grafana-clickhouse-datasource
