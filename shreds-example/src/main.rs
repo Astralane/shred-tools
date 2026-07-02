@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let mut slots: HashMap<u64, SlotState> = HashMap::new();
     let mut seen_triggers: HashSet<String> = HashSet::new();
     let mut last_prune = Instant::now();
+    let mut last_sent = Instant::now();
     let ttl = Duration::from_secs(args.slot_ttl_secs);
 
     while running.load(Ordering::SeqCst) {
@@ -130,10 +131,13 @@ async fn main() -> anyhow::Result<()> {
                 for (trigger_slot, trigger_sig) in
                     ingest_shred(&mut slots, &packet, &watch_wallet, &mut seen_triggers)
                 {
-                    let shared = shared.clone();
-                    tokio::spawn(async move {
-                        handle_trigger(shared, trigger_slot, trigger_sig).await;
-                    });
+                    if last_sent.elapsed() >= Duration::from_secs(1) {
+                        last_sent = Instant::now();
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            handle_trigger(shared, trigger_slot, trigger_sig).await;
+                        });
+                    }
                 }
             }
             Ok(None) => break, // receiver thread gone
