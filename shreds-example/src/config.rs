@@ -27,7 +27,7 @@ pub struct Args {
     pub lamports_per_cu: u64,
 
     /// iris2 endpoint (query-param sendTransaction, text/plain base64 body).
-    #[arg(long, default_value = "https://edge.astralane.io/iris2")]
+    #[arg(long, default_value = "https://fr.gateway.astralane.io/iris2")]
     pub iris_url: String,
 
     /// shred-pay endpoint.
