@@ -34,19 +34,10 @@ cargo run --release -- \
   --watch-wallet <BASE58_PUBKEY> \
   --keypair-path /path/to/funded-keypair.json \
   --api-key <YOUR_API_KEY> \
-  --shred-port 20000 \
-  --iris-url http://127.0.0.1:8888/iris2 \
-  --shred-pay-url http://127.0.0.1:8888/shred-pay \
-  --rpc-url https://api.mainnet-beta.solana.com
+  --shred-port 20000 
 ```
 
 See `--help` for all options and defaults.
 
 > **Note:** for this client to receive anything, shreds-hub must be forwarding
 > shreds to this host on `--shred-port` (configured in its listener set).
-
-## Shred decoding dependencies
-
-`solana-ledger` and `solana-entry` are pinned to the same agave fork that
-shreds-hub uses (`nuel77/agave`, branch `xdp-read-dev`) so the wire shred
-format decodes correctly. Keep them in sync with shreds-hub.
