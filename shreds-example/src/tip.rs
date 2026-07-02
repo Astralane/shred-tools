@@ -1,7 +1,5 @@
 //! Self-contained tip-transaction builder.
-//!
-//! Mirrors `common::utils::create_signed_tipped_transaction` from the
-//! txn-router workspace so this example has no internal-crate dependencies.
+
 
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;

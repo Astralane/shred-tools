@@ -15,7 +15,7 @@ pub struct Args {
     pub watch_wallet: String,
 
     /// Astralane tip account the transfer tips (must be an accepted tip wallet).
-    #[arg(long, default_value = "astraRVUuTHjpwEVvNBeQEgwYx9w9CFyfxjYoobCZhL")]
+    #[arg(long, default_value = "ASTZHptaMgYVMX6DAocDr1vVXLran5PpfKfQtVTSWkfE")]
     pub tip_address: String,
 
     /// Lamports to transfer/tip to the tip account.
@@ -27,11 +27,11 @@ pub struct Args {
     pub lamports_per_cu: u64,
 
     /// iris2 endpoint (query-param sendTransaction, text/plain base64 body).
-    #[arg(long, default_value = "http://127.0.0.1:8888/iris2")]
+    #[arg(long, default_value = "https://edge.astralane.io/iris2")]
     pub iris_url: String,
 
     /// shred-pay endpoint.
-    #[arg(long, default_value = "http://127.0.0.1:8888/shred-pay")]
+    #[arg(long, default_value = "https://edge.astralane.io/shred-pay")]
     pub shred_pay_url: String,
 
     /// API key (query param `api-key`) used for both iris and shred-pay.
