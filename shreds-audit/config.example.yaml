@@ -1,0 +1,58 @@
+# shred-audit example configuration.
+# Copy to config.yaml and edit, then: ./shred-audit --config config.yaml
+
+# JSON-RPC endpoint. Used ONLY to fetch the leader schedule (getLeaderSchedule /
+# getEpochInfo) so shreds can be verified against the right leader. Never on the
+# hot path. Any mainnet RPC works; a private one is friendlier if you run long.
+rpc_url: "https://api.mainnet-beta.solana.com"
+
+# Every UDP port shred-audit binds. Tell each provider to send to one of these.
+# The simplest setup: one port per provider (see the `providers` block below).
+listen_ports: [20001, 20002, 20003]
+
+# Interface to bind. Default 0.0.0.0 (all interfaces); pin to one IP if you like.
+bind_ip: "0.0.0.0"
+
+# How each provider is identified. Matching is most-specific-first:
+#   1. (source_ip, dest_port)   both given
+#   2. dest_port                port only
+#   3. source_ip                ips only
+# A provider MUST set `port`, `ips`, or both. A `port` here must also appear in
+# `listen_ports` above, or startup fails (this prevents silent black-holing).
+providers:
+  # Identify purely by the port they send to (easiest — one port each):
+  - name: alpha
+    port: 20001
+
+  - name: beta
+    port: 20002
+
+  # Identify by source IP instead (e.g. they can't pick a stable dest port).
+  # Matches this IP arriving on ANY of listen_ports.
+  - name: gamma
+    ips: ["203.0.113.7"]
+
+  # Most specific: only this source IP arriving on this exact port.
+  - name: delta
+    port: 20003
+    ips: ["198.51.100.4", "198.51.100.5"]
+
+# Where archives are written.
+output_dir: "./out"
+
+# Roll a new archive every N seconds. Set 0 to write a single archive at exit
+# (useful for short, fixed-duration captures with --duration-secs).
+rotate_secs: 600
+
+# Verification thread pool size. 0 = (physical cores - 1). Verifying every shred
+# is cheap (~1 ed25519 op per FEC set thanks to signature dedup), so the default
+# is plenty; raise only if you see `dropped` climbing under very high pps.
+verify_threads: 0
+
+# A FEC set is finalized once the highest slot seen is this many slots past it.
+# Larger = wait longer for stragglers; smaller = flush sooner. 10 is a good start.
+fec_max_wait_slots: 10
+
+# Optional: drop shreds whose `version` field doesn't match this exact value.
+# Leave null to accept every version.
+shred_version: null
