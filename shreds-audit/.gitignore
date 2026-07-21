@@ -1,13 +1,14 @@
-# The Rust build directory.
+# Rust build directory.
 /target
-target
 
 # Capture archives. These hold per-provider arrival timestamps — the competitive
 # latency data the whole tool exists to produce. Never commit them.
 out/
+out-*/
 
-# Local provider setup (ports, source IPs, RPC endpoint). Copy config.example.yaml
-# to config.yaml and edit; the example is the one that is tracked.
+# Local provider setup (ports, source IPs, RPC endpoint, gRPC tokens). Copy
+# config.example.yaml to config.yaml and edit; only the example is tracked.
 config.yaml
 
-.idea
+# Editor / IDE.
+.idea/

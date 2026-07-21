@@ -1,15 +1,13 @@
 //! Live, in-memory provider comparison for the `--tui` dashboard.
 //!
-//! Consumes finalized `SetRow`s as they are harvested and accumulates, per
-//! provider, the same head-to-head numbers the offline viewer computes — winrate,
-//! mean microseconds behind the fastest, and coverage — cumulatively over the run.
+//! Consumes finalized `SetRow`s as harvested and accumulates, per provider, the
+//! same head-to-head numbers the offline viewer computes — winrate, mean
+//! microseconds behind the fastest, and coverage — cumulatively over the run.
 //!
-//! It deliberately keeps no per-set history: O(providers) memory and O(1) work per
-//! set, so it can run for days without growing. And it reports *comparison only* —
-//! invalid / bad-signature / bad-data counts are never surfaced here. Those are a
-//! matter for the archive and the offline viewer, where a broken proof can be
-//! inspected shred by shred; a live glance is for "who is fastest", not for
-//! leveling an accusation at a provider.
+//! Keeps no per-set history: O(providers) memory, O(1) per set, so it runs for
+//! days without growing. Reports *comparison only* — invalid / bad-signature /
+//! bad-data counts are never surfaced here; those belong to the archive and
+//! offline viewer. A live glance is for "who is fastest", not for accusations.
 
 use ahash::AHashMap;
 

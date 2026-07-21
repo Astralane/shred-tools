@@ -1,10 +1,9 @@
 //! Opt-in live terminal dashboard (`--tui`).
 //!
-//! Shows the head-to-head provider comparison only — winrate, mean microseconds
-//! behind the fastest, and coverage — and never invalid / bad-signature counts. A
-//! live glance answers "who is fastest"; whether a provider *tampered* is a
-//! deliberate, offline judgement made against the archive, not a number that
-//! flickers past on a dashboard.
+//! Shows the head-to-head provider comparison only — winrate, mean µs behind the
+//! fastest, coverage — never invalid / bad-signature counts. Whether a provider
+//! *tampered* is a deliberate offline judgement against the archive, not a number
+//! that flickers past on a dashboard.
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -24,7 +23,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{live::LiveStats, registry::Registry};
+use crate::{live::LiveStats, out::TxnCompareSummary, registry::Registry};
 
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -66,8 +65,14 @@ impl Tui {
         Ok(false)
     }
 
-    pub fn draw(&mut self, stats: &LiveStats, reg: &Registry, footer: &str) -> Result<()> {
-        self.terminal.draw(|f| render(f, stats, reg, footer))?;
+    pub fn draw(
+        &mut self,
+        stats: &LiveStats,
+        reg: &Registry,
+        txn: Option<&TxnCompareSummary>,
+        footer: &str,
+    ) -> Result<()> {
+        self.terminal.draw(|f| render(f, stats, reg, txn, footer))?;
         Ok(())
     }
 }
@@ -79,13 +84,29 @@ impl Drop for Tui {
     }
 }
 
-fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, footer: &str) {
-    let areas = Layout::vertical([
-        Constraint::Length(1), // title
-        Constraint::Min(3),    // comparison table
-        Constraint::Length(1), // footer
-    ])
-    .split(f.area());
+fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, txn: Option<&TxnCompareSummary>, footer: &str) {
+    // When a gRPC comparison is active, give it its own panel below the provider
+    // table; otherwise the provider table takes the whole middle.
+    let txn_rows = txn
+        .map(|t| t.sources.iter().filter(|s| s.seen > 0).count())
+        .unwrap_or(0);
+    let areas = if txn_rows > 0 {
+        Layout::vertical([
+            Constraint::Length(1),                     // title
+            Constraint::Min(3),                        // provider comparison table
+            Constraint::Length(txn_rows as u16 + 3),   // gRPC comparison panel
+            Constraint::Length(1),                     // footer
+        ])
+        .split(f.area())
+    } else {
+        Layout::vertical([
+            Constraint::Length(1), // title
+            Constraint::Min(3),    // provider comparison table
+            Constraint::Length(1), // footer
+        ])
+        .split(f.area())
+    };
+    let footer_area = areas[areas.len() - 1];
 
     let total = stats.total_sets();
 
@@ -153,6 +174,50 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, footer: &str) {
     f.render_widget(Paragraph::new(title), areas[0]);
     f.render_widget(table, areas[1]);
 
+    // Transaction-timing panel: shred stream and each gRPC feed as peer rows.
+    if let Some(t) = txn {
+        if !t.sources.is_empty() {
+            let us = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
+            let head = Row::new(["source", "winrate", "µs behind", "µs p90", "seen"])
+                .style(Style::default().add_modifier(Modifier::BOLD));
+            let mut srcs: Vec<&crate::out::TxnSource> =
+                t.sources.iter().filter(|s| s.seen > 0).collect();
+            srcs.sort_by(|a, b| {
+                b.winrate
+                    .unwrap_or(-1.0)
+                    .partial_cmp(&a.winrate.unwrap_or(-1.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let rows = srcs.into_iter().map(|s| {
+                Row::new([
+                    s.name.clone(),
+                    s.winrate
+                        .map(|w| format!("{:.1}%", w * 100.0))
+                        .unwrap_or_else(|| "—".into()),
+                    us(s.behind_p50_us),
+                    us(s.behind_p90_us),
+                    fmt_int(s.seen),
+                ])
+            });
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Min(14),
+                    Constraint::Length(9),
+                    Constraint::Length(11),
+                    Constraint::Length(9),
+                    Constraint::Length(12),
+                ],
+            )
+            .header(head)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " transaction race — shreds vs gRPC · {} contested txns ",
+                fmt_int(t.contested)
+            )));
+            f.render_widget(table, areas[2]);
+        }
+    }
+
     let foot = if footer.is_empty() {
         "q / Esc to quit".to_string()
     } else {
@@ -160,7 +225,7 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, footer: &str) {
     };
     f.render_widget(
         Paragraph::new(Line::from(foot)).style(Style::default().add_modifier(Modifier::DIM)),
-        areas[2],
+        footer_area,
     );
 }
 

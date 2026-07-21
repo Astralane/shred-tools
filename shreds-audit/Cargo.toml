@@ -37,6 +37,29 @@ parquet = { version = "55", features = ["arrow", "zstd"] }
 arrow-array = "55"
 arrow-schema = "55"
 
+# Optional shred-vs-gRPC transaction-timing comparison. The shred stream is
+# reconstructed into transactions with the same agave fork used for shred parsing,
+# and a Geyser/Yellowstone gRPC feed is subscribed for the same transactions; the
+# two are matched by transaction signature. All of this is inert unless the config
+# declares one or more `grpc_sources`.
+solana-entry = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
+    "agave-unstable-api",
+] }
+wincode = "0.2.5"
+
+# Async runtime for the gRPC subscription (the rest of the tool stays synchronous;
+# the runtime lives on its own thread).
+tokio = { version = "1.40", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+
+# Geyser gRPC client (yellowstone-grpc compatible).
+tonic = { version = "~0.14.2", features = ["tls-native-roots"] }
+tonic-prost = "~0.14.0"
+prost = "0.14"
+prost-types = "0.14"
+bytes = "1"
+futures = "0.3"
+
 [dev-dependencies]
 # Real shred construction for the signature-path integration test. Same fork
 # pin as the runtime dep so the wire format is identical.
@@ -47,6 +70,10 @@ solana-ledger = { git = "https://github.com/nuel77/agave", branch = "xdp-read-de
 solana-entry = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
     "agave-unstable-api",
 ] }
+
+[build-dependencies]
+tonic-prost-build = "~0.14.0"
+protoc-bin-vendored = "3"
 
 [profile.release]
 opt-level = 3

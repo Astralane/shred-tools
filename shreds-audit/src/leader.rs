@@ -5,11 +5,15 @@
 //! that turns "this is a well-formed shred" into "this is a shred the leader
 //! actually signed".
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
+
+use crate::names;
 
 #[derive(Deserialize)]
 struct RpcResp<T> {
@@ -53,6 +57,9 @@ struct Epoch {
 pub struct LeaderSchedule {
     rpc_url: String,
     inner: RwLock<Option<Epoch>>,
+    /// validator identity pubkey -> display name, from on-chain validator-info.
+    /// Empty until `refresh_names` succeeds; names are optional throughout.
+    names: RwLock<AHashMap<Pubkey, String>>,
 }
 
 impl LeaderSchedule {
@@ -60,6 +67,7 @@ impl LeaderSchedule {
         Arc::new(Self {
             rpc_url: rpc_url.to_string(),
             inner: RwLock::new(None),
+            names: RwLock::new(AHashMap::new()),
         })
     }
 
@@ -73,7 +81,39 @@ impl LeaderSchedule {
                 first_slot,
                 leaders,
             })),
+            names: RwLock::new(AHashMap::new()),
         })
+    }
+
+    /// Fetch validator display names. Best-effort: the caller logs and continues
+    /// on error, names stay absent.
+    pub fn refresh_names(&self) -> Result<()> {
+        let map = names::fetch_validator_names()?;
+        let n = map.len();
+        *self.names.write().unwrap() = map;
+        eprintln!("validator names: {n} resolved");
+        Ok(())
+    }
+
+    /// `pubkey string -> name` for the distinct leaders in the current epoch
+    /// that published a name. Shaped for direct embedding in the manifest.
+    pub fn leader_names(&self) -> HashMap<String, String> {
+        let names = self.names.read().unwrap();
+        if names.is_empty() {
+            return HashMap::new();
+        }
+        let guard = self.inner.read().unwrap();
+        let Some(e) = guard.as_ref() else {
+            return HashMap::new();
+        };
+        let mut distinct: AHashSet<Pubkey> = AHashSet::new();
+        for l in e.leaders.iter().flatten() {
+            distinct.insert(*l);
+        }
+        distinct
+            .into_iter()
+            .filter_map(|pk| names.get(&pk).map(|name| (pk.to_string(), name.clone())))
+            .collect()
     }
 
     /// What we can say about `slot`, in one lock acquisition.

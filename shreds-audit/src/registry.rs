@@ -100,6 +100,10 @@ mod tests {
             verify_threads: 1,
             fec_max_wait_slots: 10,
             shred_version: None,
+            live_secs: 10,
+            ping_secs: 30,
+            grpc_sources: vec![],
+            txn_settle_secs: 1,
         }
     }
 

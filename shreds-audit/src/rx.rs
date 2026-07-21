@@ -25,6 +25,9 @@ use std::{
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 
+use ahash::AHashSet;
+
+use crate::pinger::NetMon;
 use crate::registry::{ProviderId, Registry};
 
 /// Datagrams pulled per `recvmmsg` call.
@@ -74,6 +77,7 @@ pub fn spawn_receivers(
     bind_ip: Ipv4Addr,
     ports: &[u16],
     registry: Arc<Registry>,
+    netmon: Arc<NetMon>,
     tx: Sender<Vec<Packet>>,
     stats: Arc<RxStats>,
     exit: Arc<AtomicBool>,
@@ -83,13 +87,14 @@ pub fn spawn_receivers(
         let sock = bind_socket(bind_ip, port)
             .with_context(|| format!("binding {bind_ip}:{port}"))?;
         let registry = registry.clone();
+        let netmon = netmon.clone();
         let tx = tx.clone();
         let stats = stats.clone();
         let exit = exit.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("rx-{port}"))
-                .spawn(move || rx_loop(sock, port, registry, tx, stats, exit))?,
+                .spawn(move || rx_loop(sock, port, registry, netmon, tx, stats, exit))?,
         );
     }
     Ok(handles)
@@ -269,12 +274,16 @@ fn rx_loop(
     sock: Socket,
     port: u16,
     registry: Arc<Registry>,
+    netmon: Arc<NetMon>,
     tx: Sender<Vec<Packet>>,
     stats: Arc<RxStats>,
     exit: Arc<AtomicBool>,
 ) {
     let fd = sock.as_raw_fd();
     let mut arena = RecvArena::new();
+    // Source IPs this thread has already reported to the NetMon. Keeps the
+    // shared lock cold: we touch it only on the first sight of each IP.
+    let mut reported_ips: AHashSet<(ProviderId, Ipv4Addr)> = AHashSet::new();
     // Last value of the kernel's cumulative per-socket drop counter.
     let mut last_ovfl: u32 = 0;
     // 100 ms so a quiet socket still notices `exit`.
@@ -352,6 +361,12 @@ fn rx_loop(
                 stats.unmatched.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+
+            // First time this thread sees this source IP for this provider,
+            // tell the NetMon so the pinger can probe it.
+            if reported_ips.insert((provider, src_ip)) {
+                netmon.observe(provider, src_ip);
+            }
 
             batch.push(Packet {
                 provider,

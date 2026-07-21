@@ -1,58 +1,40 @@
-# shred-audit example configuration.
-# Copy to config.yaml and edit, then: ./shred-audit --config config.yaml
+# shred-audit config. Copy to config.yaml and run: ./shred-audit --config config.yaml
+#
+# This is all you need to get started. Every other setting has a sensible
+# default — see the "Optional" section at the bottom only if you want to tune.
 
-# JSON-RPC endpoint. Used ONLY to fetch the leader schedule (getLeaderSchedule /
-# getEpochInfo) so shreds can be verified against the right leader. Never on the
-# hot path. Any mainnet RPC works; a private one is friendlier if you run long.
+# Mainnet RPC, used only to fetch the leader schedule (not on the hot path).
 rpc_url: "https://api.mainnet-beta.solana.com"
 
-# Every UDP port shred-audit binds. Tell each provider to send to one of these.
-# The simplest setup: one port per provider (see the `providers` block below).
-listen_ports: [20001, 20002, 20003]
+# UDP ports shred-audit listens on. Give each provider one port and tell them
+# to send there.
+listen_ports: [20001, 20002]
 
-# Interface to bind. Default 0.0.0.0 (all interfaces); pin to one IP if you like.
-bind_ip: "0.0.0.0"
-
-# How each provider is identified. Matching is most-specific-first:
-#   1. (source_ip, dest_port)   both given
-#   2. dest_port                port only
-#   3. source_ip                ips only
-# A provider MUST set `port`, `ips`, or both. A `port` here must also appear in
-# `listen_ports` above, or startup fails (this prevents silent black-holing).
+# One entry per provider. Easiest setup: match by the port they send to.
 providers:
-  # Identify purely by the port they send to (easiest — one port each):
   - name: alpha
     port: 20001
-
   - name: beta
     port: 20002
 
-  # Identify by source IP instead (e.g. they can't pick a stable dest port).
-  # Matches this IP arriving on ANY of listen_ports.
-  - name: gamma
-    ips: ["203.0.113.7"]
-
-  # Most specific: only this source IP arriving on this exact port.
-  - name: delta
-    port: 20003
-    ips: ["198.51.100.4", "198.51.100.5"]
-
-# Where archives are written.
-output_dir: "./out"
-
-# Roll a new archive every N seconds. Set 0 to write a single archive at exit
-# (useful for short, fixed-duration captures with --duration-secs).
-rotate_secs: 600
-
-# Verification thread pool size. 0 = (physical cores - 1). Verifying every shred
-# is cheap (~1 ed25519 op per FEC set thanks to signature dedup), so the default
-# is plenty; raise only if you see `dropped` climbing under very high pps.
-verify_threads: 0
-
-# A FEC set is finalized once the highest slot seen is this many slots past it.
-# Larger = wait longer for stragglers; smaller = flush sooner. 10 is a good start.
-fec_max_wait_slots: 10
-
-# Optional: drop shreds whose `version` field doesn't match this exact value.
-# Leave null to accept every version.
-shred_version: null
+# ---------------------------------------------------------------------------
+# Optional — uncomment and edit only if you need it. Defaults shown.
+# ---------------------------------------------------------------------------
+#
+# bind_ip: "0.0.0.0"        # interface to bind
+# output_dir: "./out"       # where archives are written
+# rotate_secs: 600          # new archive every N secs (0 = one archive at exit)
+# shred_version: null       # drop shreds not matching this version (null = all)
+#
+# Match a provider by source IP instead of / in addition to port:
+# providers:
+#   - name: gamma
+#     ips: ["203.0.113.7"]
+#
+# Compare shred delivery against Geyser/Yellowstone gRPC feeds by transaction
+# arrival time:
+# grpc_sources:
+#   - name: my-grpc
+#     url: "https://grpc.example.com:443"
+#     x_token: "optional-auth-token"
+#     commitment: processed   # processed | confirmed | finalized

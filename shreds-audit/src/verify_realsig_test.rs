@@ -136,13 +136,10 @@ fn data_hash_covers_block_content_and_only_block_content() {
 
         // Some header bytes (the slot, say) route the shred rather than describe
         // it: corrupt one and the shred is rejected outright instead of being
-        // classified. That is the strongest outcome available — a shred that never
-        // reaches the aggregator can never be misfiled as a mere proof bug — so it
-        // counts as both "data hash did not survive" and "did not verify".
-        // "Verified" means exactly what the aggregator accepts: the merkle root
-        // reconstructed AND the leader's signature checked out. Anything else —
-        // a bad signature, an unreconstructable root, an outright drop — is a
-        // shred that never counts as delivered.
+        // classified. That is the strongest outcome available — a dropped shred
+        // can never be misfiled as a proof bug — so it counts as both "data hash
+        // did not survive" and "did not verify". "Verified" here means what the
+        // aggregator accepts: merkle root reconstructed AND signature checked out.
         let (hash, verified) = match out.first() {
             Some(v) => (v.data_hash, v.merkle_ok && v.sig_ok == Some(true)),
             None => (None, false),

@@ -1,11 +1,18 @@
 mod agg;
 mod config;
+mod deshred;
+mod grpc;
 mod leader;
 mod live;
+mod names;
 mod out;
+mod pinger;
+mod proto;
 mod registry;
 mod rx;
+mod sigreg;
 mod tui;
+mod txncmp;
 mod verify;
 #[cfg(test)]
 mod verify_realsig_test;
@@ -24,11 +31,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::{
-    agg::Aggregator,
+    agg::{Aggregator, SetRow},
     config::Config,
     leader::LeaderSchedule,
     live::LiveStats,
-    out::{Archive, Counters, Manifest},
+    out::{Archive, Counters, Manifest, TxnCompareSummary},
+    pinger::NetMon,
     registry::Registry,
     rx::RxStats,
     tui::Tui,
@@ -51,10 +59,16 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     duration_secs: u64,
     /// Disable the live TUI dashboard and print the periodic status line instead.
-    /// The TUI is the default on a real terminal; it always falls back to the
-    /// status line when stdout is not a terminal (piped, nohup, systemd).
+    /// The TUI is the default on a real terminal; it falls back to the status
+    /// line when stdout is not a terminal (piped, nohup, systemd).
     #[arg(long)]
     no_tui: bool,
+    /// Realtime mode: also refresh a stable `<output_dir>/live.zip` every
+    /// `live_secs` (config, default 10) with the current window's data, for the
+    /// web viewer's "watch URL" mode. Rotation into timestamped archives is
+    /// unaffected. Serve the dir yourself (e.g. `python3 -m http.server`).
+    #[arg(long)]
+    live: bool,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +87,10 @@ fn main() -> Result<()> {
     schedule
         .refresh()
         .context("initial leader schedule fetch — check rpc_url")?;
+    // Validator names for the viewer. Best-effort; never fatal.
+    if let Err(e) = schedule.refresh_names() {
+        eprintln!("validator names unavailable ({e:#}); the viewer will show pubkeys");
+    }
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.verify_thread_count())
@@ -94,15 +112,26 @@ fn main() -> Result<()> {
     // unbounded and start reporting our own backlog as network latency.
     let (tx, rx_chan) = crossbeam_channel::bounded::<Vec<rx::Packet>>(16_384);
 
+    // Source IPs per provider (from the rx threads) and their ping RTTs.
+    let netmon = Arc::new(pinger::NetMon::new());
+
     let _rx_handles = rx::spawn_receivers(
         cfg.bind_ip,
         &cfg.listen_ports,
         registry.clone(),
+        netmon.clone(),
         tx,
         rx_stats.clone(),
         exit.clone(),
     )
     .context("binding sockets")?;
+
+    let _ping_handle = pinger::spawn(
+        netmon.clone(),
+        cfg.clone(),
+        registry.clone(),
+        exit.clone(),
+    );
 
     let out_dir = PathBuf::from(&cfg.output_dir);
     std::fs::create_dir_all(&out_dir)?;
@@ -110,24 +139,52 @@ fn main() -> Result<()> {
     let mut vstats = VerifyStats::default();
     let mut aggregator = Aggregator::new(cfg.fec_max_wait_slots);
 
+    // Optional shred-vs-gRPC transaction-timing comparison. `None` unless the
+    // config declares one or more `grpc_sources`.
+    let txn_compare = txncmp::TxnCompare::start(&cfg);
+
     let mut archive_start = out::now_unix_ns();
     let mut work_dir = out_dir.join(format!(".work-{archive_start}"));
     let mut archive = Archive::create(&work_dir, args.dump_shreds)?;
 
     let started = Instant::now();
     let mut last_report = Instant::now();
+    // Cached comparison snapshot, refreshed on a timer so the TUI and live viewer
+    // don't recompute it every frame over the full signature set.
+    let mut last_txn = Instant::now();
+    let mut txn_snap: Option<TxnCompareSummary> = txn_compare.as_ref().map(|tc| tc.snapshot());
     let mut last_rotate = Instant::now();
     let mut last_sched_check = Instant::now();
     let mut last_draw = Instant::now();
     let mut archives: Vec<PathBuf> = Vec::new();
 
+    // Realtime mode (--live): accumulate the window's finalized rows and refresh
+    // live.zip every `live_secs`. window_rows is cleared on rotation, so it holds
+    // at most one window; with rotate_secs = 0 it grows for the whole run, so set
+    // a modest rotate_secs for long live captures.
+    let live_secs = if cfg.live_secs == 0 { 10 } else { cfg.live_secs };
+    let mut window_rows: Vec<SetRow> = Vec::new();
+    let mut last_live = Instant::now();
+    if args.live {
+        eprintln!(
+            "live mode: refreshing {}/live.zip every {live_secs}s — serve that dir and point the \
+             viewer's watch-URL at live.zip",
+            out_dir.display()
+        );
+        if cfg.rotate_secs == 0 {
+            eprintln!(
+                "  note: rotate_secs = 0, so the live window (and live.zip) grows for the whole \
+                 run; set rotate_secs for a bounded live snapshot"
+            );
+        }
+    }
+
     // Live comparison + dashboard (opt-in). Entering the TUI takes over the
     // terminal, so it happens only after the startup warnings have printed.
     let mut live = LiveStats::new();
     let mut footer = String::new();
-    // The dashboard is the default, but it takes over the terminal — so it runs
-    // only on a real TTY, never when output is piped or redirected (nohup, systemd,
-    // a log file), where it would spew escape codes or fail to start outright.
+    // The dashboard takes over the terminal, so it runs only on a real TTY, never
+    // when output is piped or redirected, where it would spew escape codes.
     let mut tui = None;
     if !args.no_tui {
         if std::io::stdout().is_terminal() {
@@ -153,6 +210,11 @@ fn main() -> Result<()> {
 
         match rx_chan.recv_timeout(Duration::from_millis(100)) {
             Ok(packets) => {
+                if let Some(tc) = &txn_compare {
+                    for p in &packets {
+                        tc.feed(p.rx_unix_ns, p.provider, &p.data);
+                    }
+                }
                 let verified =
                     verify_chunk(packets, &schedule, cfg.shred_version, &mut vstats);
                 for s in &verified {
@@ -171,6 +233,9 @@ fn main() -> Result<()> {
             if tui.is_some() {
                 live.ingest(&rows);
             }
+            if args.live {
+                window_rows.extend_from_slice(&rows);
+            }
             archive.write_sets(&registry, &rows)?;
         }
 
@@ -188,19 +253,40 @@ fn main() -> Result<()> {
             }
         }
 
-        // Live dashboard: poll for quit and repaint a few times a second. When it
-        // is off, the plain periodic status line is the non-interactive fallback.
+        // Refresh the comparison snapshot on a timer (not every frame).
+        if txn_compare.is_some() && last_txn.elapsed() >= Duration::from_secs(2) {
+            last_txn = Instant::now();
+            txn_snap = txn_compare.as_ref().map(|tc| tc.snapshot());
+        }
+
+        // Live dashboard: poll for quit and repaint a few times a second;
+        // otherwise the periodic status line is the non-interactive fallback.
         if let Some(t) = tui.as_mut() {
             if t.quit_requested()? {
                 exit.store(true, Ordering::Relaxed);
             }
             if last_draw.elapsed() >= Duration::from_millis(400) {
                 last_draw = Instant::now();
-                t.draw(&live, &registry, &footer)?;
+                t.draw(&live, &registry, txn_snap.as_ref(), &footer)?;
             }
         } else if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();
             report(&rx_stats, &vstats, &aggregator, archive.invalid_data);
+        }
+
+        if args.live && last_live.elapsed() >= Duration::from_secs(live_secs) {
+            last_live = Instant::now();
+            if let Err(e) = write_live_snapshot(
+                &out_dir, &window_rows, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+                txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
+            ) {
+                let msg = format!("live snapshot failed: {e:#}");
+                if tui.is_some() {
+                    footer = msg;
+                } else {
+                    eprintln!("{msg}");
+                }
+            }
         }
 
         if cfg.rotate_secs > 0 && last_rotate.elapsed() >= Duration::from_secs(cfg.rotate_secs) {
@@ -211,8 +297,8 @@ fn main() -> Result<()> {
             }
             archive.write_sets(&registry, &rows)?;
             let zip = finish_archive(
-                archive, &out_dir, &cfg, &registry, &schedule, &rx_stats, &vstats,
-                aggregator.shreds_after_window(), archive_start,
+                archive, &out_dir, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+                txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
             )?;
             if tui.is_some() {
                 footer = format!("wrote {}", zip.display());
@@ -224,6 +310,8 @@ fn main() -> Result<()> {
             archive_start = out::now_unix_ns();
             work_dir = out_dir.join(format!(".work-{archive_start}"));
             archive = Archive::create(&work_dir, args.dump_shreds)?;
+            // A new window begins; live.zip now tracks it from empty.
+            window_rows.clear();
         }
     }
 
@@ -233,6 +321,11 @@ fn main() -> Result<()> {
     // Drain whatever the receivers already queued before we tear down.
     exit.store(true, Ordering::Relaxed);
     while let Ok(packets) = rx_chan.try_recv() {
+        if let Some(tc) = &txn_compare {
+            for p in &packets {
+                tc.feed(p.rx_unix_ns, p.provider, &p.data);
+            }
+        }
         let verified = verify_chunk(packets, &schedule, cfg.shred_version, &mut vstats);
         for s in &verified {
             aggregator.ingest(s);
@@ -243,15 +336,36 @@ fn main() -> Result<()> {
     }
     let rows = aggregator.harvest(true);
     archive.write_sets(&registry, &rows)?;
+    // Final comparison snapshot so the last archive reflects the whole run.
+    if let Some(tc) = &txn_compare {
+        txn_snap = Some(tc.final_snapshot());
+    }
+    // Refresh live.zip once more so it reflects the final state, not the
+    // second-to-last snapshot.
+    if args.live {
+        window_rows.extend_from_slice(&rows);
+        if let Err(e) = write_live_snapshot(
+            &out_dir, &window_rows, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+            txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
+        ) {
+            eprintln!("final live snapshot failed: {e:#}");
+        }
+    }
     let bad_data = archive.invalid_data;
     let zip = finish_archive(
-        archive, &out_dir, &cfg, &registry, &schedule, &rx_stats, &vstats,
-        aggregator.shreds_after_window(), archive_start,
+        archive, &out_dir, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+        txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
     )?;
     eprintln!("wrote {}", zip.display());
     archives.push(zip);
 
     report(&rx_stats, &vstats, &aggregator, bad_data);
+
+    // Stop the gRPC/deshred subsystem and print the transaction-timing summary.
+    if let Some(tc) = txn_compare {
+        tc.finish();
+    }
+
     eprintln!("\n{} archive(s):", archives.len());
     for a in &archives {
         eprintln!("  {}", a.display());
@@ -265,12 +379,75 @@ fn finish_archive(
     out_dir: &std::path::Path,
     cfg: &Config,
     registry: &Registry,
+    netmon: &NetMon,
     schedule: &LeaderSchedule,
     rx_stats: &RxStats,
     vstats: &VerifyStats,
+    txn: Option<&TxnCompareSummary>,
     shreds_after_window: u64,
     started_at: i64,
 ) -> Result<PathBuf> {
+    let manifest = build_manifest(
+        &archive, cfg, registry, netmon, schedule, rx_stats, vstats, txn, shreds_after_window,
+        started_at,
+    );
+    let name = format!(
+        "shred-audit-{}-{}.zip",
+        chrono::DateTime::from_timestamp_nanos(started_at).format("%Y%m%dT%H%M%SZ"),
+        manifest.hostname
+    );
+    archive.finish(&out_dir.join(name), manifest)
+}
+
+/// Write/refresh the stable `live.zip` snapshot atomically (temp file + rename,
+/// so a watcher never reads a half-written zip). `rows` is the current window's
+/// finalized sets; the run's full history still lands in the rotated archives.
+#[allow(clippy::too_many_arguments)]
+fn write_live_snapshot(
+    out_dir: &std::path::Path,
+    rows: &[SetRow],
+    cfg: &Config,
+    registry: &Registry,
+    netmon: &NetMon,
+    schedule: &LeaderSchedule,
+    rx_stats: &RxStats,
+    vstats: &VerifyStats,
+    txn: Option<&TxnCompareSummary>,
+    shreds_after_window: u64,
+    window_start: i64,
+) -> Result<()> {
+    let work = out_dir.join(".live-work");
+    let mut a = Archive::create(&work, false)?;
+    a.write_sets(registry, rows)?;
+    let mut manifest = build_manifest(
+        &a, cfg, registry, netmon, schedule, rx_stats, vstats, txn, shreds_after_window,
+        window_start,
+    );
+    manifest.notes.insert(
+        0,
+        "LIVE snapshot — an in-progress capture window, refreshed periodically. It is replaced \
+         atomically each refresh; the full run lands in the rotated timestamped archives."
+            .to_string(),
+    );
+    let tmp = out_dir.join(".live.zip.tmp");
+    a.finish(&tmp, manifest)?;
+    std::fs::rename(&tmp, out_dir.join("live.zip"))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_manifest(
+    archive: &Archive,
+    cfg: &Config,
+    registry: &Registry,
+    netmon: &NetMon,
+    schedule: &LeaderSchedule,
+    rx_stats: &RxStats,
+    vstats: &VerifyStats,
+    txn: Option<&TxnCompareSummary>,
+    shreds_after_window: u64,
+    started_at: i64,
+) -> Manifest {
     let mut notes = Vec::new();
     let no_ts = rx_stats.no_timestamp.load(Ordering::Relaxed);
     if no_ts > 0 {
@@ -352,7 +529,7 @@ fn finish_archive(
         ));
     }
 
-    let manifest = Manifest {
+    Manifest {
         tool: "shred-audit",
         tool_version: VERSION,
         schema_version: SCHEMA_VERSION,
@@ -369,6 +546,9 @@ fn finish_archive(
         max_slot: archive.max_slot,
         rows_fec_sets: archive.rows_sets,
         rows_shreds: archive.rows_shreds,
+        provider_pings: netmon.provider_pings(cfg, registry),
+        leader_names: schedule.leader_names(),
+        txn_compare: txn.cloned(),
         counters: Counters {
             udp_received: rx_stats.received.load(Ordering::Relaxed),
             udp_unmatched: unmatched,
@@ -392,14 +572,7 @@ fn finish_archive(
             shreds_after_window,
         },
         notes,
-    };
-
-    let name = format!(
-        "shred-audit-{}-{}.zip",
-        chrono::DateTime::from_timestamp_nanos(started_at).format("%Y%m%dT%H%M%SZ"),
-        manifest.hostname
-    );
-    archive.finish(&out_dir.join(name), manifest)
+    }
 }
 
 fn report(rx_stats: &RxStats, v: &VerifyStats, agg: &Aggregator, bad_data: u64) {

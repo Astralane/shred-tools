@@ -65,13 +65,9 @@ struct SetState {
     /// look faster than it really delivered.
     first_ns: Option<i64>,
     last_ns: Option<i64>,
-    /// Arrival time of every accepted shred that added a NEW position — one entry
-    /// per distinct delivered shred, so `arrivals.len()` equals the delivered
-    /// count. The set is reconstructable once `num_data` shreds are in hand (any k
-    /// of the k+m, by Reed-Solomon), but `num_data` can be learned late, so at
-    /// ingest time we cannot know which arrival was the decisive k-th. We keep
-    /// them all and pick the k-th at finalize — that makes `decode_ns` the true
-    /// moment the set became decodable, not the moment we learned its size.
+    /// Arrival of every accepted shred that added a NEW position — one per distinct
+    /// delivered shred. `num_data` can be learned late, so the decisive k-th arrival
+    /// isn't knowable at ingest; keep them all and pick the k-th at finalize.
     arrivals: Vec<i64>,
     /// Every shred of this set that failed verification, held as
     /// `(is_code, shred_index, data_hash)` until the set is finalized. `is_code`
@@ -162,16 +158,13 @@ impl Aggregator {
     }
 
     pub fn ingest(&mut self, s: &VerifiedShred) {
-        // A shred whose slot is at or below the finalized floor belongs to a set
-        // this aggregator has already emitted. Re-inserting it would create a
-        // fresh SetState and, at the next harvest, a second row for the same
-        // (provider, slot, fec_set_index). The viewer resolves duplicate keys
-        // last-wins, so that one-shred `is_valid = false` straggler would
-        // overwrite the provider's real — often winning — row. Drop it and count
-        // it rather than let a slow or reordering provider's late delivery erase
-        // its own result. `evicted_upto` only advances to the harvest cutoff, so
-        // sets force-drained early by rotation (slot > cutoff) are not caught
-        // here and can still be re-created — a separate, known limitation.
+        // A shred at or below the finalized floor belongs to a set already emitted.
+        // Re-inserting it would create a fresh SetState and a second row for the same
+        // (provider, slot, fec_set_index); the viewer resolves duplicate keys
+        // last-wins, so that one-shred `is_valid = false` straggler would overwrite
+        // the provider's real, often winning, row. Drop and count it instead.
+        // (`evicted_upto` only tracks the harvest cutoff, so sets drained early by
+        // rotation (slot > cutoff) can still be re-created — a known limitation.)
         if s.slot <= self.evicted_upto {
             self.shreds_after_window += 1;
             return;

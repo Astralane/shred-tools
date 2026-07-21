@@ -133,12 +133,11 @@ pub fn verify_chunk(
                 continue;
             }
         }
-        // A shred whose variant this build does not understand is NOT an invalid
-        // shred. We cannot reconstruct its merkle root, so it would fail the check
-        // and be counted against the provider — and on the day Solana ships a new
-        // shred variant, every provider would light up at ~100% invalid and this
-        // tool would look like it had caught mass tampering. "I don't know what
-        // this is" gets its own counter and never a verdict.
+        // A variant this build does not understand is NOT an invalid shred: we
+        // can't reconstruct its merkle root, so it would fail the check and count
+        // against the provider. On the day Solana ships a new variant, every
+        // provider would light up at ~100% invalid and look like mass tampering.
+        // "I don't know what this is" gets its own counter, never a verdict.
         let Some((is_code, _, _, _)) = decode_variant(s[VARIANT_OFFSET]) else {
             stats.unsupported_variant += 1;
             continue;
@@ -283,9 +282,8 @@ fn verify_triples(triples: &[([u8; 64], [u8; 32], Pubkey)], stats: &mut VerifySt
     if ed25519_dalek::verify_batch(&msgs, &sigs, &keys).is_ok() {
         return vec![true; triples.len()];
     }
-    // At least one is bad. Batch verification cannot say which, so fall back.
-    // Invalid shreds are routine here, so this path is hot
-    // and must stay correct rather than clever.
+    // At least one is bad; batch verification cannot say which, so fall back.
+    // Invalid shreds are routine here, so this path is hot.
     stats.batch_fallbacks += 1;
     triples.par_iter().map(verify_one).collect()
 }

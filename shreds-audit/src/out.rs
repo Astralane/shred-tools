@@ -2,8 +2,8 @@
 //!
 //! `fec_sets.parquet` is the primary artifact — one row per
 //! (provider, slot, fec_set_index) with absolute nanosecond arrival times.
-//! Per-shred rows are optional (`dump_shreds`) because at ~100 kpps a ten
-//! minute capture is ~60 M rows / ~1 GB, which nobody is going to mail back.
+//! Per-shred rows are optional (`dump_shreds`): at ~100 kpps a ten-minute
+//! capture is ~60 M rows / ~1 GB.
 
 use std::{
     fs::{self, File},
@@ -45,7 +45,65 @@ pub struct Manifest {
     pub rows_fec_sets: u64,
     pub rows_shreds: u64,
     pub counters: Counters,
+    /// One row per (provider, source IP) with the latest ping RTT. For an
+    /// IP-configured provider these are the configured IPs; for a port-configured
+    /// provider they are the source IPs observed sending to it.
+    pub provider_pings: Vec<ProviderPing>,
+    /// Leader identity pubkey (base58) -> display name, from on-chain
+    /// validator-info. Only leaders that published a name appear; the viewer
+    /// falls back to the pubkey for the rest. Empty if names couldn't be fetched.
+    pub leader_names: std::collections::HashMap<String, String>,
+    /// shred-vs-gRPC transaction-timing comparison, present only when the config
+    /// declared `grpc_sources`. Null otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_compare: Option<TxnCompareSummary>,
     pub notes: Vec<String>,
+}
+
+/// Transaction-timing comparison across sources. The reconstructed shred stream
+/// and every gRPC feed are peers here — each is one row, framed like a provider
+/// in the FEC-set comparison: winrate (delivered first) and µs behind the fastest.
+#[derive(Serialize, Clone, Default)]
+pub struct TxnCompareSummary {
+    /// Distinct transaction signatures seen across all sources.
+    pub distinct_signatures: u64,
+    /// Transactions seen by at least two sources (the ones a race is defined on).
+    pub contested: u64,
+    pub sources: Vec<TxnSource>,
+}
+
+/// One source in the transaction-timing comparison — the shred stream or a gRPC
+/// feed, presented identically.
+#[derive(Serialize, Clone, Default)]
+pub struct TxnSource {
+    pub name: String,
+    /// "shreds" for the reconstructed shred stream, "grpc" for a gRPC feed.
+    pub kind: String,
+    /// Distinct transactions this source delivered.
+    pub seen: u64,
+    /// Contested transactions this source was present for.
+    pub contested: u64,
+    /// Fraction of its contested transactions this source delivered first.
+    pub winrate: Option<f64>,
+    /// Microseconds behind the earliest source, over its contested transactions.
+    pub behind_mean_us: Option<f64>,
+    pub behind_p50_us: Option<f64>,
+    pub behind_p90_us: Option<f64>,
+    pub behind_p99_us: Option<f64>,
+}
+
+/// A single pinged source IP belonging to a provider. RTT is a coarse
+/// reachability/network-distance hint — NOT comparable to the decode deltas.
+#[derive(Serialize, Clone)]
+pub struct ProviderPing {
+    pub provider: String,
+    pub ip: String,
+    /// "configured" (declared in the config) or "observed" (seen on the wire).
+    pub source: &'static str,
+    /// Average ICMP RTT in ms, or null if the host did not reply / not yet pinged.
+    pub rtt_ms: Option<f64>,
+    /// When this IP was last pinged (unix ns), or null if never.
+    pub checked_at_unix_ns: Option<i64>,
 }
 
 #[derive(Serialize, Clone, Default)]

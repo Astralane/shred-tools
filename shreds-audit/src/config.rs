@@ -36,6 +36,56 @@ pub struct Config {
     /// Drop shreds whose `version` field does not match, if set.
     #[serde(default)]
     pub shred_version: Option<u16>,
+
+    /// With `--live`, how often (seconds) to refresh the stable `live.zip`
+    /// snapshot of the current window. 0 falls back to 10.
+    #[serde(default = "default_live_secs")]
+    pub live_secs: u64,
+
+    /// How often (seconds) to re-ping each provider's IPs. 0 falls back to 30.
+    #[serde(default = "default_ping_secs")]
+    pub ping_secs: u64,
+
+    /// Optional Geyser/Yellowstone gRPC feeds to compare against the shred stream
+    /// by transaction arrival time. When empty, the transaction-timing comparison
+    /// is entirely inert and the tool behaves exactly as before.
+    #[serde(default)]
+    pub grpc_sources: Vec<GrpcSourceCfg>,
+
+    /// Seconds a slot must be quiet (no new shred) before its buffered shreds are
+    /// reconstructed into transactions for the timing comparison. 0 falls back to 1.
+    #[serde(default = "default_txn_settle_secs")]
+    pub txn_settle_secs: u64,
+}
+
+fn default_txn_settle_secs() -> u64 {
+    1
+}
+
+fn default_commitment() -> String {
+    "processed".to_string()
+}
+
+/// A Geyser gRPC transaction feed for the shred-vs-gRPC timing comparison.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GrpcSourceCfg {
+    pub name: String,
+    /// gRPC endpoint, e.g. `https://host:port`.
+    pub url: String,
+    /// Optional `x-token` auth header value.
+    #[serde(default)]
+    pub x_token: Option<String>,
+    /// Subscription commitment: processed | confirmed | finalized. Default processed.
+    #[serde(default = "default_commitment")]
+    pub commitment: String,
+}
+
+fn default_live_secs() -> u64 {
+    10
+}
+
+fn default_ping_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -102,6 +152,20 @@ impl Config {
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             bail!("config: duplicate provider names");
+        }
+
+        let mut grpc_names = std::collections::HashSet::new();
+        for g in &self.grpc_sources {
+            if g.url.trim().is_empty() {
+                bail!("grpc source `{}` has an empty url", g.name);
+            }
+            if !grpc_names.insert(g.name.as_str()) {
+                bail!("config: duplicate grpc source name `{}`", g.name);
+            }
+            match g.commitment.to_lowercase().as_str() {
+                "processed" | "confirmed" | "finalized" => {}
+                other => bail!("grpc source `{}`: invalid commitment `{other}`", g.name),
+            }
         }
         Ok(())
     }
