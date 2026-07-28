@@ -104,6 +104,10 @@ mod tests {
             ping_secs: 30,
             grpc_sources: vec![],
             txn_settle_secs: 1,
+            onchain_verify: true,
+            onchain_sample_secs: 5,
+            onchain_rpc_url: None,
+            onchain_lag_slots: 32,
         }
     }
 

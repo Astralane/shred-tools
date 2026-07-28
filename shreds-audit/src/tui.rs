@@ -1,9 +1,16 @@
 //! Opt-in live terminal dashboard (`--tui`).
 //!
-//! Shows the head-to-head provider comparison only — winrate, mean µs behind the
-//! fastest, coverage — never invalid / bad-signature counts. Whether a provider
-//! *tampered* is a deliberate offline judgement against the archive, not a number
-//! that flickers past on a dashboard.
+//! Shows the head-to-head provider comparison — winrate, mean µs behind the
+//! fastest, coverage — and never the per-shred invalid / bad-signature counts.
+//! Whether a provider *tampered* with a shred is a deliberate offline judgement
+//! against the archive, not a number that flickers past on a dashboard.
+//!
+//! The transaction panel's `bad sigs` column is the one exception, and it is a
+//! different kind of number: a rate against the block the cluster actually
+//! produced, over slots sampled seconds after the fact. It is not an accusation
+//! about a single packet, it accumulates rather than flickers, and a source
+//! silently dropping or inventing transactions is invisible in every other
+//! column here — a feed that delivers nothing real still wins races.
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -178,7 +185,7 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, txn: Option<&TxnComp
     if let Some(t) = txn {
         if !t.sources.is_empty() {
             let us = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
-            let head = Row::new(["source", "winrate", "µs behind", "µs p90", "seen"])
+            let head = Row::new(["source", "winrate", "µs behind", "µs p90", "seen", "bad sigs"])
                 .style(Style::default().add_modifier(Modifier::BOLD));
             let mut srcs: Vec<&crate::out::TxnSource> =
                 t.sources.iter().filter(|s| s.seen > 0).collect();
@@ -197,6 +204,7 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, txn: Option<&TxnComp
                     us(s.behind_p50_us),
                     us(s.behind_p90_us),
                     fmt_int(s.seen),
+                    fmt_bad_sigs(s),
                 ])
             });
             let table = Table::new(
@@ -207,12 +215,21 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, txn: Option<&TxnComp
                     Constraint::Length(11),
                     Constraint::Length(9),
                     Constraint::Length(12),
+                    Constraint::Length(17),
                 ],
             )
             .header(head)
             .block(Block::default().borders(Borders::ALL).title(format!(
-                " transaction race — shreds vs gRPC · {} contested txns ",
-                fmt_int(t.contested)
+                " transaction race — shreds vs gRPC · {} contested txns{} ",
+                fmt_int(t.contested),
+                if t.onchain_slots_checked > 0 {
+                    format!(
+                        " · {} slots audited onchain",
+                        fmt_int(t.onchain_slots_checked)
+                    )
+                } else {
+                    String::new()
+                }
             )));
             f.render_widget(table, areas[2]);
         }
@@ -227,6 +244,32 @@ fn render(f: &mut Frame, stats: &LiveStats, reg: &Registry, txn: Option<&TxnComp
         Paragraph::new(Line::from(foot)).style(Style::default().add_modifier(Modifier::DIM)),
         footer_area,
     );
+}
+
+/// The onchain-audit cell: the discrepancy rate, with the raw count behind it.
+///
+/// Both numbers are needed to read the row. The rate is what compares two
+/// sources; the count is what says whether the rate is worth believing yet —
+/// early in a capture it can be one sampled slot.
+fn fmt_bad_sigs(s: &crate::out::TxnSource) -> String {
+    match s.onchain_bad_pct {
+        // A source sampled only on slots it delivered nothing for has no rate,
+        // and must not be shown a zero — that reads as a clean bill of health.
+        None => "—".into(),
+        Some(p) => {
+            let pct = p * 100.0;
+            // A real discrepancy must never render as a flat 0.00% — that reads
+            // as "clean" when it means "small". Anything nonzero says so.
+            let pct = if s.onchain_bad > 0 && pct < 0.01 {
+                "<0.01%".to_string()
+            } else if pct >= 1.0 {
+                format!("{pct:.1}%")
+            } else {
+                format!("{pct:.2}%")
+            };
+            format!("{pct} ({})", fmt_int(s.onchain_bad))
+        }
+    }
 }
 
 /// Group a number with thin thousands separators for readability.

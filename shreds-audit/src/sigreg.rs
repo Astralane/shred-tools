@@ -23,6 +23,8 @@ use std::collections::VecDeque;
 
 use ahash::AHashMap;
 
+use crate::verification::onchain_signatures::{SlotSigIndex, SourceSlot};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SourceKind {
     /// Transactions reconstructed from the shred (UDP) stream.
@@ -71,6 +73,11 @@ pub struct SigRegistry {
     behind_n: Vec<u64>,
     /// Bounded ring of recent ns-behind samples per source, for percentiles.
     behind_ring: Vec<VecDeque<i64>>,
+
+    /// Per-slot signature sets for the onchain audit. Inert until enabled, and
+    /// kept here so filing a delivery costs nothing beyond the lock the caller
+    /// already holds — the race and the audit see the same stream of records.
+    onchain: SlotSigIndex,
 }
 
 impl SigRegistry {
@@ -90,6 +97,7 @@ impl SigRegistry {
             behind_sum_ns: vec![0; n],
             behind_n: vec![0; n],
             behind_ring: vec![VecDeque::new(); n],
+            onchain: SlotSigIndex::disabled(),
         }
     }
 
@@ -119,6 +127,10 @@ impl SigRegistry {
         if slot > self.high_slot {
             self.high_slot = slot;
         }
+        // Before the dedupe below: the race deliberately ignores a re-delivery,
+        // but the audit has to see it — a transaction is in a block once, so a
+        // repeat is a discrepancy with that block.
+        self.onchain.record(sid, slot, &sig);
         let n = self.names.len();
         if !self.events.contains_key(&sig) {
             self.distinct_total += 1;
@@ -135,6 +147,22 @@ impl SigRegistry {
             row.ts[sid] = Some(ns);
             self.seen[sid] += 1;
         }
+    }
+
+    /// Start filing deliveries for the onchain audit, keeping `retain_slots`
+    /// worth of them. Until this is called the index is inert.
+    pub fn enable_onchain_index(&mut self, n_sources: usize, retain_slots: u64) {
+        self.onchain.enable(n_sources, retain_slots);
+    }
+
+    /// Highest slot the audit index has seen — the tip its sampling lags behind.
+    pub fn onchain_tip(&self) -> u64 {
+        self.onchain.tip()
+    }
+
+    /// Claim one slot's deliveries for auditing, removing them from the index.
+    pub fn take_onchain_slot(&mut self, slot: u64) -> Option<Vec<SourceSlot>> {
+        self.onchain.take(slot)
     }
 
     /// Retire settled signatures into the running totals to keep `events` bounded.

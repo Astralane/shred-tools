@@ -132,6 +132,50 @@ execution, so it has no commitment or transaction-status metadata. Do not set
 `commitment` on a `deshred` source. Both modes are matched to locally
 reconstructed transactions by `transaction.signatures[0]`.
 
+#### Is any of it real? — the onchain audit
+
+Winning a race proves a source was *fast*, not that it was *right*. A feed that
+drops half a block, repeats itself, or invents transactions outright wins exactly
+the same races as one that relays the leader's block faithfully — and a
+pre-execution `deshred` feed carries no proof of anything at all.
+
+So whenever the comparison is running, shred-audit also audits it against the
+chain. Every `onchain_sample_secs` (default 5) it picks one recent slot, asks an
+RPC node for that block's signatures with `getBlock`, and diffs them against what
+every source delivered for that slot:
+
+| | |
+|---|---|
+| `onchain_missed` | in the block, this source never delivered it |
+| `onchain_corrupted` | this source delivered it, the block does not contain it |
+| `onchain_duplicated` | delivered more than once for the same slot |
+| `onchain_bad_pct` | all three, over the transactions in the sampled blocks |
+
+`onchain_bad_pct` is the **`bad sigs`** column in the dashboard, and every count
+lands in the manifest. It is the only number here that says whether a source's
+transactions exist.
+
+Two things to know before you read it:
+
+- **It samples.** One slot every 5 s against ~2.5 produced a second — roughly one
+  slot in twelve. The rates converge over a capture of any length; the raw counts
+  are over sampled slots only, so compare sources on the percentage, never on
+  `onchain_bad`.
+- **Each sample is a `getBlock` call.** A public endpoint will rate-limit it.
+  Point `onchain_rpc_url` at your own node (or raise `onchain_sample_secs`), and
+  check `onchain_rpc_errors` in the manifest before trusting a run.
+
+A source is only scored on a slot it delivered *something* for; slots it was
+absent for are counted separately (`onchain_slots_absent`) and never scored, so a
+feed that was merely disconnected is never reported as one that corrupted a
+block. A `finalized` subscription lags past the sampling window and will show up
+this way — use `processed` if you want it audited.
+
+Some `onchain_corrupted` is expected and honest: a pre-execution deshred feed
+reports transactions that may never land, and a `processed` subscription can
+deliver from a fork that lost. Read it next to `onchain_missed` before calling it
+fabrication. Set `onchain_verify: false` to turn the whole thing off.
+
 ## The report
 
 Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:

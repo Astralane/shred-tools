@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, GrpcMode};
 use crate::deshred::{is_data_shred_variant, Deshredder, ShredInput};
 use crate::sigreg::{SigRegistry, SourceKind};
+use crate::verification::onchain_signatures::{OnchainAudit, OnchainVerifier};
 
 /// Offset of the shred variant byte within a shred payload. Matches `verify.rs`.
 const VARIANT_OFFSET: usize = 64;
@@ -31,6 +32,9 @@ pub struct TxnCompare {
     feed: Sender<ShredInput>,
     deshred_handle: Option<JoinHandle<()>>,
     grpc_handle: Option<JoinHandle<()>>,
+    /// Onchain signature audit, when enabled. `None` leaves every `onchain_*`
+    /// field zero rather than inventing a verdict from an audit that never ran.
+    onchain: Option<OnchainVerifier>,
     cancel: CancellationToken,
 }
 
@@ -51,7 +55,22 @@ impl TxnCompare {
             names.push(g.name.clone());
             kinds.push(SourceKind::Grpc);
         }
+        let n_sources = names.len();
         let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
+        let cancel = CancellationToken::new();
+
+        // Started before anything can record, so the audit's per-slot index is
+        // live from the first delivery rather than missing the opening slots.
+        let onchain = cfg.onchain_verify.then(|| {
+            OnchainVerifier::start(
+                cfg.effective_onchain_rpc_url().to_string(),
+                cfg.onchain_lag_slots,
+                cfg.onchain_sample_secs,
+                n_sources,
+                reg.clone(),
+                cancel.clone(),
+            )
+        });
 
         // Deshred worker. Bounded so a stall drops feed rather than growing without
         // limit; the comparison is best-effort and must never become the backlog.
@@ -64,7 +83,6 @@ impl TxnCompare {
             .ok();
 
         // gRPC runtime thread. gRPC source ids start after the shred providers.
-        let cancel = CancellationToken::new();
         let grpc_sources = cfg.grpc_sources.clone();
         let grpc_reg = reg.clone();
         let grpc_cancel = cancel.clone();
@@ -84,12 +102,22 @@ impl TxnCompare {
              transaction + {} deshred gRPC source(s); racing every source by transaction signature",
             transaction_sources, deshred_sources
         );
+        if onchain.is_some() {
+            eprintln!(
+                "txn-compare: auditing every source against the chain — sampling one slot every \
+                 {}s at {} slots behind the tip via getBlock on {}",
+                cfg.onchain_sample_secs,
+                cfg.onchain_lag_slots,
+                cfg.effective_onchain_rpc_url()
+            );
+        }
 
         Some(Self {
             reg,
             feed,
             deshred_handle,
             grpc_handle,
+            onchain,
             cancel,
         })
     }
@@ -98,14 +126,18 @@ impl TxnCompare {
     /// embedded in the archive manifest for the result page and web viewer.
     /// Retires signatures that have settled, keeping the registry bounded.
     pub fn snapshot(&self) -> crate::out::TxnCompareSummary {
-        build_snapshot(&self.reg, false)
+        build_snapshot(&self.reg, self.onchain_audit(), false)
     }
 
     /// Like [`snapshot`](Self::snapshot) but finalizes every in-flight signature,
     /// so the last archive reflects the whole run rather than dropping the tail
     /// still within the eviction margin.
     pub fn final_snapshot(&self) -> crate::out::TxnCompareSummary {
-        build_snapshot(&self.reg, true)
+        build_snapshot(&self.reg, self.onchain_audit(), true)
+    }
+
+    fn onchain_audit(&self) -> Option<OnchainAudit> {
+        self.onchain.as_ref().map(|v| v.snapshot())
     }
 
     /// Tee a received datagram into the deshred feed if it looks like a data shred.
@@ -132,10 +164,11 @@ impl TxnCompare {
             feed,
             mut deshred_handle,
             mut grpc_handle,
+            onchain,
             cancel,
         } = self;
         // Dropping the sender lets the deshred worker drain and exit; cancel stops
-        // the gRPC runtime.
+        // the gRPC runtime and the onchain sampler.
         cancel.cancel();
         drop(feed);
         if let Some(h) = deshred_handle.take() {
@@ -144,7 +177,13 @@ impl TxnCompare {
         if let Some(h) = grpc_handle.take() {
             let _ = h.join();
         }
-        report(&reg);
+        // Read the audit before joining: the totals are what we report, and the
+        // worker only ever adds to them.
+        let audit = onchain.as_ref().map(|v| v.snapshot());
+        if let Some(v) = onchain {
+            v.finish();
+        }
+        report(&reg, audit);
     }
 }
 
@@ -152,7 +191,11 @@ impl TxnCompare {
 /// peer row. The registry lock is held only long enough to finalize settled rows
 /// and copy each source's raw totals — the per-source percentile sort runs after
 /// the lock is released, off the hot `record_first` path.
-fn build_snapshot(reg: &Mutex<SigRegistry>, force: bool) -> crate::out::TxnCompareSummary {
+fn build_snapshot(
+    reg: &Mutex<SigRegistry>,
+    audit: Option<OnchainAudit>,
+    force: bool,
+) -> crate::out::TxnCompareSummary {
     use crate::out::{TxnCompareSummary, TxnSource};
     use crate::sigreg::{percentiles_us, SourceKind};
 
@@ -180,8 +223,13 @@ fn build_snapshot(reg: &Mutex<SigRegistry>, force: bool) -> crate::out::TxnCompa
 
     let sources = rows
         .into_iter()
-        .map(|mut r| {
+        .enumerate()
+        .map(|(sid, mut r)| {
             let pct = percentiles_us(&mut r.raw.behind_ns);
+            let oc = audit
+                .as_ref()
+                .and_then(|a| a.sources.get(sid).copied())
+                .unwrap_or_default();
             TxnSource {
                 name: r.name,
                 kind: match r.kind {
@@ -195,6 +243,14 @@ fn build_snapshot(reg: &Mutex<SigRegistry>, force: bool) -> crate::out::TxnCompa
                 behind_p50_us: pct.p50,
                 behind_p90_us: pct.p90,
                 behind_p99_us: pct.p99,
+                onchain_slots_checked: oc.slots_checked,
+                onchain_slots_absent: oc.slots_absent,
+                onchain_txns: oc.onchain_txns,
+                onchain_missed: oc.missed,
+                onchain_corrupted: oc.corrupted,
+                onchain_duplicated: oc.duplicated,
+                onchain_bad: oc.bad(),
+                onchain_bad_pct: oc.bad_fraction(),
             }
         })
         .collect();
@@ -202,13 +258,17 @@ fn build_snapshot(reg: &Mutex<SigRegistry>, force: bool) -> crate::out::TxnCompa
         distinct_signatures: distinct,
         contested,
         sources,
+        onchain_slots_checked: audit.as_ref().map(|a| a.slots_checked).unwrap_or(0),
+        onchain_slots_unavailable: audit.as_ref().map(|a| a.slots_unavailable).unwrap_or(0),
+        onchain_rpc_errors: audit.as_ref().map(|a| a.rpc_errors).unwrap_or(0),
+        onchain_last_error: audit.and_then(|a| a.last_error),
     }
 }
 
 /// One-line-per-source summary to stderr at shutdown (logs only; the real output
 /// is the snapshot embedded in the manifest).
-fn report(reg: &Mutex<SigRegistry>) {
-    let snap = build_snapshot(reg, true);
+fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>) {
+    let snap = build_snapshot(reg, audit, true);
     eprintln!(
         "\ntxn-compare: {} distinct signatures, {} contested",
         snap.distinct_signatures, snap.contested
@@ -224,6 +284,34 @@ fn report(reg: &Mutex<SigRegistry>) {
             s.behind_p90_us.unwrap_or(0.0),
             s.behind_p99_us.unwrap_or(0.0),
             s.seen,
+        );
+    }
+
+    if snap.onchain_slots_checked == 0 {
+        return;
+    }
+    eprintln!(
+        "\nonchain audit: {} slots sampled ({} skipped by the cluster, {} rpc errors)",
+        snap.onchain_slots_checked, snap.onchain_slots_unavailable, snap.onchain_rpc_errors
+    );
+    for s in &snap.sources {
+        if s.onchain_slots_checked == 0 && s.onchain_slots_absent == 0 {
+            continue;
+        }
+        eprintln!(
+            "  {:<20} bad={} ({} of {} txns: missed {} corrupted {} duplicated {}) \
+             over {} slots, absent for {}",
+            s.name,
+            s.onchain_bad_pct
+                .map(|p| format!("{:.3}%", p * 100.0))
+                .unwrap_or_else(|| "—".into()),
+            s.onchain_bad,
+            s.onchain_txns,
+            s.onchain_missed,
+            s.onchain_corrupted,
+            s.onchain_duplicated,
+            s.onchain_slots_checked,
+            s.onchain_slots_absent,
         );
     }
 }

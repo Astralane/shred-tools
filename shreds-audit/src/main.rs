@@ -13,6 +13,7 @@ mod rx;
 mod sigreg;
 mod tui;
 mod txncmp;
+mod verification;
 mod verify;
 #[cfg(test)]
 mod verify_realsig_test;
@@ -528,6 +529,9 @@ fn build_manifest(
             vstats.no_leader
         ));
     }
+    if let Some(t) = txn {
+        notes.extend(onchain_notes(cfg, t));
+    }
 
     Manifest {
         tool: "shred-audit",
@@ -573,6 +577,80 @@ fn build_manifest(
         },
         notes,
     }
+}
+
+/// Caveats for the onchain transaction audit. It is a *sample* — one slot every
+/// `onchain_sample_secs` against ~2.5 produced a second — so the archive has to
+/// say what was sampled and what was not, or its counts read as totals.
+fn onchain_notes(cfg: &Config, txn: &TxnCompareSummary) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !cfg.onchain_verify {
+        notes.push(
+            "the onchain transaction audit was disabled (`onchain_verify: false`), so nothing here \
+             checks that the transactions each source delivered are the ones the cluster actually \
+             produced. Every `onchain_*` field is zero because the check did not run — not because \
+             the sources were clean"
+                .to_string(),
+        );
+        return notes;
+    }
+    if txn.onchain_slots_checked == 0 {
+        notes.push(format!(
+            "the onchain transaction audit ran but compared no slot ({} rpc errors, {} slots the \
+             cluster produced no block for). Every `onchain_*` field is zero because nothing was \
+             checked. Last error: {}",
+            txn.onchain_rpc_errors,
+            txn.onchain_slots_unavailable,
+            txn.onchain_last_error.as_deref().unwrap_or("none"),
+        ));
+        return notes;
+    }
+    notes.push(format!(
+        "the onchain transaction audit compared {} sampled slots (one every {}s, taken {} slots \
+         behind the tip) against getBlock on {}. `onchain_missed` / `onchain_corrupted` / \
+         `onchain_duplicated` are counts over those slots only — compare sources on \
+         `onchain_bad_pct`, not on the raw counts",
+        txn.onchain_slots_checked,
+        cfg.onchain_sample_secs,
+        cfg.onchain_lag_slots,
+        cfg.effective_onchain_rpc_url(),
+    ));
+    if txn.onchain_rpc_errors > 0 {
+        notes.push(format!(
+            "{} getBlock calls failed during the audit, so fewer slots were sampled than the \
+             capture length suggests. The rates are still over the slots that did land, but a \
+             rate-limited endpoint biases WHICH slots those were — give `onchain_rpc_url` its own \
+             node if this is large. Last error: {}",
+            txn.onchain_rpc_errors,
+            txn.onchain_last_error.as_deref().unwrap_or("unknown"),
+        ));
+    }
+    for s in &txn.sources {
+        if s.onchain_slots_absent > 0 && s.onchain_slots_checked == 0 {
+            notes.push(format!(
+                "source `{}` delivered nothing for any of the {} sampled slots and was never \
+                 scored against the chain. A feed subscribed at a commitment that lags past the \
+                 {}-slot sampling window looks exactly like this — it is not a finding about the \
+                 source's data",
+                s.name, s.onchain_slots_absent, cfg.onchain_lag_slots,
+            ));
+        }
+    }
+    if let Some(worst) = txn
+        .sources
+        .iter()
+        .filter(|s| s.onchain_corrupted > 0)
+        .max_by_key(|s| s.onchain_corrupted)
+    {
+        notes.push(format!(
+            "at least one source delivered transactions the sampled blocks do not contain \
+             (`{}`: {} of {}). A pre-execution deshred feed can legitimately do this for a \
+             transaction that never landed, and a `processed` subscription can do it across a \
+             dropped fork — read it next to `onchain_missed` before treating it as fabrication",
+            worst.name, worst.onchain_corrupted, worst.onchain_txns,
+        ));
+    }
+    notes
 }
 
 fn report(rx_stats: &RxStats, v: &VerifyStats, agg: &Aggregator, bad_data: u64) {

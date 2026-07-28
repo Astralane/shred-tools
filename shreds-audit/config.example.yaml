@@ -43,3 +43,17 @@ providers:
 #     url: "https://deshred.example.com:443"
 #     x_token: "optional-auth-token"
 #     mode: deshred           # pre-execution; commitment is not supported
+#
+# Onchain audit of the transaction comparison above. Every few seconds it samples
+# one recent slot, fetches that block's signatures with getBlock, and counts what
+# each source missed, invented, or repeated. On by default whenever grpc_sources is
+# set, and inert without it.
+#
+# Each sample is one getBlock call. A public endpoint will rate-limit it — give it
+# your own node or raise onchain_sample_secs, or you will audit far fewer slots
+# than the run length suggests (shows up as `onchain_rpc_errors` in the manifest).
+#
+# onchain_verify: true
+# onchain_sample_secs: 5    # seconds between sampled slots (one getBlock each)
+# onchain_rpc_url: "http://your-node:8899"   # defaults to rpc_url
+# onchain_lag_slots: 32     # how far behind the tip to sample (~13s); minimum 8

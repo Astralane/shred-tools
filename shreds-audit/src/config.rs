@@ -56,10 +56,51 @@ pub struct Config {
     /// reconstructed into transactions for the timing comparison. 0 falls back to 1.
     #[serde(default = "default_txn_settle_secs")]
     pub txn_settle_secs: u64,
+
+    /// Audit what each transaction source delivered against the block the cluster
+    /// actually produced: sample one recent slot on a timer, fetch its signatures
+    /// with `getBlock`, and count every discrepancy. Rides along with the
+    /// `grpc_sources` comparison and is inert without it.
+    #[serde(default = "default_true")]
+    pub onchain_verify: bool,
+
+    /// Seconds between sampled slots — one `getBlock` call each. The audit is a
+    /// sample either way (the cluster produces ~2.5 slots/s), so this trades
+    /// how fast the rates converge against how hard it leans on the endpoint.
+    #[serde(default = "default_onchain_sample_secs")]
+    pub onchain_sample_secs: u64,
+
+    /// RPC endpoint for the `getBlock` sampling. Defaults to `rpc_url`. Point it
+    /// at your own node if `rpc_url` is a rate-limited public endpoint — the
+    /// leader schedule is fetched once an epoch, this is on a timer.
+    #[serde(default)]
+    pub onchain_rpc_url: Option<String>,
+
+    /// How many slots behind the tip to sample. Far enough back that every source
+    /// has had time to deliver the slot and the block is available over RPC.
+    #[serde(default = "default_onchain_lag_slots")]
+    pub onchain_lag_slots: u64,
 }
 
 fn default_txn_settle_secs() -> u64 {
     1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// ~13 s behind the tip: past the deshred settle window, past `confirmed`
+/// availability, and still a small enough window to hold in memory.
+fn default_onchain_lag_slots() -> u64 {
+    32
+}
+
+/// One block every 5 s — roughly one slot in twelve. Gentle enough that a shared
+/// endpoint tolerates it for a long capture, and still ~700 sampled slots an
+/// hour, which is far more than the rates need to settle.
+fn default_onchain_sample_secs() -> u64 {
+    5
 }
 
 /// A Geyser gRPC transaction feed for the shred-vs-gRPC timing comparison.
@@ -92,6 +133,13 @@ pub enum GrpcMode {
 impl GrpcSourceCfg {
     pub fn effective_commitment(&self) -> &str {
         self.commitment.as_deref().unwrap_or("processed")
+    }
+}
+
+impl Config {
+    /// Endpoint the onchain audit samples blocks from.
+    pub fn effective_onchain_rpc_url(&self) -> &str {
+        self.onchain_rpc_url.as_deref().unwrap_or(&self.rpc_url)
     }
 }
 
@@ -191,6 +239,34 @@ impl Config {
                 GrpcMode::Deshred => {}
             }
         }
+
+        if self.onchain_verify {
+            if let Some(url) = &self.onchain_rpc_url {
+                if url.trim().is_empty() {
+                    bail!("config: `onchain_rpc_url` is set but empty");
+                }
+            }
+            // Not clamped to a default: an interval of zero is a request to call
+            // getBlock in a tight loop, and silently rewriting that to something
+            // else hides a misconfiguration behind an endpoint's rate limiter.
+            if self.onchain_sample_secs == 0 {
+                bail!(
+                    "config: `onchain_sample_secs` is 0 — that samples getBlock in a tight loop; \
+                     set the seconds between sampled slots (default 5), or `onchain_verify: false`"
+                );
+            }
+            // Sampling too close to the tip audits slots the sources have not
+            // finished delivering and blames them for our own impatience, which
+            // is worse than not auditing at all.
+            if self.onchain_lag_slots < 8 {
+                bail!(
+                    "config: `onchain_lag_slots` is {} — sampling that close to the tip audits \
+                     slots before every source has delivered them and reports the shortfall as \
+                     missed transactions; use 8 or more (default 32)",
+                    self.onchain_lag_slots
+                );
+            }
+        }
         Ok(())
     }
 
@@ -259,6 +335,96 @@ grpc_sources:
         )
         .unwrap_err();
         assert!(err.to_string().contains("not supported in deshred mode"));
+    }
+
+    #[test]
+    fn onchain_audit_is_on_by_default_and_falls_back_to_rpc_url() {
+        let cfg = parse(
+            r#"  - name: early
+    url: http://localhost:10000
+    mode: deshred"#,
+        )
+        .unwrap();
+        assert!(cfg.onchain_verify);
+        assert_eq!(cfg.onchain_lag_slots, 32);
+        assert_eq!(cfg.onchain_sample_secs, 5);
+        assert_eq!(cfg.effective_onchain_rpc_url(), "http://localhost:8899");
+    }
+
+    #[test]
+    fn a_sampling_interval_can_be_set() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+onchain_sample_secs: 30
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.onchain_sample_secs, 30);
+    }
+
+    #[test]
+    fn a_zero_sampling_interval_is_rejected() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+onchain_sample_secs: 0
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("onchain_sample_secs"));
+    }
+
+    #[test]
+    fn sampling_too_close_to_the_tip_is_rejected() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+onchain_lag_slots: 2
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("onchain_lag_slots"));
+    }
+
+    #[test]
+    fn a_disabled_audit_does_not_police_its_own_settings() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+onchain_verify: false
+onchain_lag_slots: 2
+onchain_sample_secs: 0
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_dedicated_onchain_endpoint_overrides_rpc_url() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+onchain_rpc_url: http://my-node:8899
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.effective_onchain_rpc_url(), "http://my-node:8899");
     }
 
     #[test]

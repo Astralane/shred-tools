@@ -70,6 +70,18 @@ pub struct TxnCompareSummary {
     /// Transactions seen by at least two sources (the ones a race is defined on).
     pub contested: u64,
     pub sources: Vec<TxnSource>,
+    /// Slots sampled and compared against the block onchain. Zero when the
+    /// onchain audit is off — every `onchain_*` field below is then meaningless.
+    pub onchain_slots_checked: u64,
+    /// Sampled slots the cluster produced no block for (a skipped leader).
+    /// Expected, and not a fault of any source.
+    pub onchain_slots_unavailable: u64,
+    /// `getBlock` calls that failed. Nonzero means the audit sampled less than
+    /// the elapsed time suggests.
+    pub onchain_rpc_errors: u64,
+    /// Most recent `getBlock` failure, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onchain_last_error: Option<String>,
 }
 
 /// One source in the transaction-timing comparison — the shred stream or a gRPC
@@ -90,6 +102,29 @@ pub struct TxnSource {
     pub behind_p50_us: Option<f64>,
     pub behind_p90_us: Option<f64>,
     pub behind_p99_us: Option<f64>,
+
+    // ---- onchain audit (see verification::onchain_signatures) ----
+    // A sampled audit against `getBlock`, not a full ledger: the counts below
+    // are over the sampled slots only, so `onchain_bad_pct` is the number to
+    // compare sources on, not `onchain_bad`.
+    /// Sampled slots this source delivered something for, and was scored on.
+    pub onchain_slots_checked: u64,
+    /// Sampled slots this source delivered nothing at all for. Not scored — a
+    /// disconnected feed is not a feed that corrupted a block.
+    pub onchain_slots_absent: u64,
+    /// Transactions in the blocks this source was scored against — the
+    /// denominator of `onchain_bad_pct`.
+    pub onchain_txns: u64,
+    /// Onchain transactions this source never delivered.
+    pub onchain_missed: u64,
+    /// Transactions this source delivered that the block does not contain.
+    pub onchain_corrupted: u64,
+    /// Transactions this source delivered more than once for the same slot.
+    pub onchain_duplicated: u64,
+    /// `missed + corrupted + duplicated` — any discrepancy with the block.
+    pub onchain_bad: u64,
+    /// `onchain_bad / onchain_txns`. Null until the source has been scored.
+    pub onchain_bad_pct: Option<f64>,
 }
 
 /// A single pinged source IP belonging to a provider. RTT is a coarse
