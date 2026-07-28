@@ -112,6 +112,26 @@ transaction arrival time, and reports which source delivered each transaction
 first. If you don't add that block, nothing changes — this is entirely opt-in.
 See the commented `grpc_sources` section in `config.example.yaml`.
 
+Each source can use either the standard post-execution transaction subscription
+or the separate pre-execution `SubscribeDeshred` API:
+
+```yaml
+grpc_sources:
+  - name: regular-geyser
+    url: "https://grpc.example.com:443"
+    mode: transactions       # default when omitted
+    commitment: processed   # processed | confirmed | finalized
+
+  - name: early-deshred
+    url: "https://deshred.example.com:443"
+    mode: deshred
+```
+
+`SubscribeDeshred` reports transactions reconstructed from shreds before
+execution, so it has no commitment or transaction-status metadata. Do not set
+`commitment` on a `deshred` source. Both modes are matched to locally
+reconstructed transactions by `transaction.signatures[0]`.
+
 ## The report
 
 Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:

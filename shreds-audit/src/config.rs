@@ -62,10 +62,6 @@ fn default_txn_settle_secs() -> u64 {
     1
 }
 
-fn default_commitment() -> String {
-    "processed".to_string()
-}
-
 /// A Geyser gRPC transaction feed for the shred-vs-gRPC timing comparison.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GrpcSourceCfg {
@@ -75,9 +71,28 @@ pub struct GrpcSourceCfg {
     /// Optional `x-token` auth header value.
     #[serde(default)]
     pub x_token: Option<String>,
-    /// Subscription commitment: processed | confirmed | finalized. Default processed.
-    #[serde(default = "default_commitment")]
-    pub commitment: String,
+    /// Which Yellowstone streaming RPC to use. Omitted for legacy configs means
+    /// the standard post-execution transaction subscription.
+    #[serde(default)]
+    pub mode: GrpcMode,
+    /// Standard transaction-subscription commitment. Omitted means processed.
+    /// SubscribeDeshred has no commitment and rejects this field when present.
+    #[serde(default)]
+    pub commitment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcMode {
+    #[default]
+    Transactions,
+    Deshred,
+}
+
+impl GrpcSourceCfg {
+    pub fn effective_commitment(&self) -> &str {
+        self.commitment.as_deref().unwrap_or("processed")
+    }
 }
 
 fn default_live_secs() -> u64 {
@@ -162,9 +177,18 @@ impl Config {
             if !grpc_names.insert(g.name.as_str()) {
                 bail!("config: duplicate grpc source name `{}`", g.name);
             }
-            match g.commitment.to_lowercase().as_str() {
-                "processed" | "confirmed" | "finalized" => {}
-                other => bail!("grpc source `{}`: invalid commitment `{other}`", g.name),
+            match g.mode {
+                GrpcMode::Transactions => match g.effective_commitment().to_lowercase().as_str() {
+                    "processed" | "confirmed" | "finalized" => {}
+                    other => bail!("grpc source `{}`: invalid commitment `{other}`", g.name),
+                },
+                GrpcMode::Deshred if g.commitment.is_some() => {
+                    bail!(
+                        "grpc source `{}`: `commitment` is not supported in deshred mode",
+                        g.name
+                    )
+                }
+                GrpcMode::Deshred => {}
             }
         }
         Ok(())
@@ -177,5 +201,74 @@ impl Config {
         std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).max(1))
             .unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(grpc_source: &str) -> Result<Config> {
+        let yaml = format!(
+            r#"
+rpc_url: http://localhost:8899
+listen_ports: [20001]
+providers:
+  - name: shreds
+    port: 20001
+grpc_sources:
+{grpc_source}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn legacy_grpc_source_defaults_to_transactions_at_processed() {
+        let cfg = parse(
+            r#"  - name: legacy
+    url: http://localhost:10000"#,
+        )
+        .unwrap();
+        let source = &cfg.grpc_sources[0];
+        assert_eq!(source.mode, GrpcMode::Transactions);
+        assert_eq!(source.commitment, None);
+        assert_eq!(source.effective_commitment(), "processed");
+    }
+
+    #[test]
+    fn deshred_source_accepts_no_commitment() {
+        let cfg = parse(
+            r#"  - name: early
+    url: http://localhost:10000
+    mode: deshred"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.grpc_sources[0].mode, GrpcMode::Deshred);
+    }
+
+    #[test]
+    fn deshred_source_rejects_commitment() {
+        let err = parse(
+            r#"  - name: early
+    url: http://localhost:10000
+    mode: deshred
+    commitment: processed"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported in deshred mode"));
+    }
+
+    #[test]
+    fn unknown_grpc_mode_is_rejected() {
+        let err = parse(
+            r#"  - name: broken
+    url: http://localhost:10000
+    mode: unknown"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 }

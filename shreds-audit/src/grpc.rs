@@ -18,11 +18,14 @@ use tonic::{
     Request, Status,
 };
 
-use crate::config::GrpcSourceCfg;
+use crate::config::{GrpcMode, GrpcSourceCfg};
 use crate::out::now_unix_ns;
 use crate::proto::geyser::{
-    geyser_client::GeyserClient, subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    geyser_client::GeyserClient, subscribe_update::UpdateOneof as TransactionUpdate,
+    subscribe_update_deshred::UpdateOneof as DeshredUpdate, CommitmentLevel,
+    SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestFilterDeshredTransactions,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateDeshredTransaction,
+    SubscribeUpdateTransaction,
 };
 use crate::sigreg::SigRegistry;
 
@@ -71,6 +74,18 @@ pub async fn run_source(
     reg: Arc<Mutex<SigRegistry>>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    match cfg.mode {
+        GrpcMode::Transactions => run_transactions_source(sid, cfg, reg, cancel).await,
+        GrpcMode::Deshred => run_deshred_source(sid, cfg, reg, cancel).await,
+    }
+}
+
+async fn run_transactions_source(
+    sid: usize,
+    cfg: GrpcSourceCfg,
+    reg: Arc<Mutex<SigRegistry>>,
+    cancel: CancellationToken,
+) -> Result<()> {
     let mut client = connect(&cfg).await?;
     let (mut sub_tx, mut stream) = {
         let (tx, rx) = mpsc::unbounded::<SubscribeRequest>();
@@ -78,6 +93,82 @@ pub async fn run_source(
         (tx, resp.into_inner())
     };
 
+    sub_tx.send(transactions_request(&cfg)).await?;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(_)) | None => break,
+                };
+                match msg.update_oneof {
+                    Some(TransactionUpdate::Transaction(tx_msg)) => {
+                        let ns = now_unix_ns();
+                        if let Some((sig, slot)) = transaction_hit(&tx_msg) {
+                            reg.lock().unwrap().record_first(sid, sig, ns, slot);
+                        }
+                    }
+                    Some(TransactionUpdate::Ping(_)) => {
+                        let _ = sub_tx.send(transactions_ping_request(1)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_deshred_source(
+    sid: usize,
+    cfg: GrpcSourceCfg,
+    reg: Arc<Mutex<SigRegistry>>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let mut client = connect(&cfg).await?;
+    let (mut sub_tx, mut stream) = {
+        let (tx, rx) = mpsc::unbounded::<SubscribeDeshredRequest>();
+        let resp = client.subscribe_deshred(rx).await?;
+        (tx, resp.into_inner())
+    };
+
+    sub_tx.send(deshred_request()).await?;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(_)) | None => break,
+                };
+                match msg.update_oneof {
+                    Some(DeshredUpdate::DeshredTransaction(tx_msg)) => {
+                        let ns = now_unix_ns();
+                        if let Some((sig, slot)) = deshred_hit(&tx_msg) {
+                            reg.lock().unwrap().record_first(sid, sig, ns, slot);
+                        }
+                    }
+                    Some(DeshredUpdate::Ping(_)) => {
+                        let _ = sub_tx.send(deshred_ping_request(1)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn transactions_request(cfg: &GrpcSourceCfg) -> SubscribeRequest {
     let mut transactions = std::collections::HashMap::new();
     transactions.insert(
         "all".to_string(),
@@ -92,59 +183,155 @@ pub async fn run_source(
             signature: None,
         },
     );
-    sub_tx
-        .send(SubscribeRequest {
-            transactions,
-            commitment: Some(commitment_of(&cfg.commitment) as i32),
-            ..Default::default()
-        })
-        .await?;
-
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            msg = stream.next() => {
-                let msg = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(_)) | None => break,
-                };
-                match msg.update_oneof {
-                    Some(UpdateOneof::Transaction(tx_msg)) => {
-                        let ns = now_unix_ns();
-                        let slot = tx_msg.slot;
-                        if let Some(sig) = first_signature(&tx_msg) {
-                            reg.lock().unwrap().record_first(sid, sig, ns, slot);
-                        }
-                    }
-                    Some(UpdateOneof::Ping(_)) => {
-                        let _ = sub_tx
-                            .send(SubscribeRequest {
-                                ping: Some(SubscribeRequestPing { id: 1 }),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    SubscribeRequest {
+        transactions,
+        commitment: Some(commitment_of(cfg.effective_commitment()) as i32),
+        ..Default::default()
     }
-    Ok(())
 }
 
-/// Pull `signatures[0]` (64 bytes) from a transaction update.
-fn first_signature(
-    tx_msg: &crate::proto::geyser::SubscribeUpdateTransaction,
-) -> Option<[u8; 64]> {
+fn deshred_request() -> SubscribeDeshredRequest {
+    let mut deshred_transactions = std::collections::HashMap::new();
+    deshred_transactions.insert(
+        "all".to_string(),
+        SubscribeRequestFilterDeshredTransactions {
+            // Include votes so the feed matches the local shred reconstruction.
+            vote: None,
+            account_include: vec![],
+            account_exclude: vec![],
+            account_required: vec![],
+        },
+    );
+    SubscribeDeshredRequest {
+        deshred_transactions,
+        ..Default::default()
+    }
+}
+
+fn transactions_ping_request(id: i32) -> SubscribeRequest {
+    SubscribeRequest {
+        ping: Some(SubscribeRequestPing { id }),
+        ..Default::default()
+    }
+}
+
+fn deshred_ping_request(id: i32) -> SubscribeDeshredRequest {
+    SubscribeDeshredRequest {
+        ping: Some(SubscribeRequestPing { id }),
+        ..Default::default()
+    }
+}
+
+/// Pull `transaction.signatures[0]` (64 bytes), deliberately ignoring the
+/// redundant info-level signature so both subscription modes use the same key.
+fn transaction_hit(tx_msg: &SubscribeUpdateTransaction) -> Option<([u8; 64], u64)> {
     let tx = tx_msg.transaction.as_ref()?.transaction.as_ref()?;
-    let sig = tx.signatures.first()?;
+    first_signature(tx.signatures.first()?).map(|sig| (sig, tx_msg.slot))
+}
+
+fn deshred_hit(tx_msg: &SubscribeUpdateDeshredTransaction) -> Option<([u8; 64], u64)> {
+    let tx = tx_msg.transaction.as_ref()?.transaction.as_ref()?;
+    first_signature(tx.signatures.first()?).map(|sig| (sig, tx_msg.slot))
+}
+
+fn first_signature(sig: &[u8]) -> Option<[u8; 64]> {
     if sig.len() != 64 {
         return None;
     }
     let mut arr = [0u8; 64];
     arr.copy_from_slice(sig);
     Some(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{
+        geyser::{SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateTransactionInfo},
+        solana::storage::confirmed_block::Transaction,
+    };
+
+    fn source(mode: GrpcMode, commitment: Option<&str>) -> GrpcSourceCfg {
+        GrpcSourceCfg {
+            name: "test".into(),
+            url: "http://localhost:10000".into(),
+            x_token: None,
+            mode,
+            commitment: commitment.map(str::to_string),
+        }
+    }
+
+    fn transaction(sig: Vec<u8>) -> Transaction {
+        Transaction {
+            signatures: vec![sig],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn builds_all_transactions_request_with_default_commitment() {
+        let request = transactions_request(&source(GrpcMode::Transactions, None));
+        assert_eq!(request.commitment, Some(CommitmentLevel::Processed as i32));
+        let filter = request.transactions.get("all").unwrap();
+        assert_eq!(filter.vote, None);
+        assert_eq!(filter.failed, None);
+    }
+
+    #[test]
+    fn builds_all_deshred_request_without_commitment() {
+        let request = deshred_request();
+        let filter = request.deshred_transactions.get("all").unwrap();
+        assert_eq!(filter.vote, None);
+        assert!(request.slots.is_empty());
+    }
+
+    #[test]
+    fn builds_mode_specific_ping_requests() {
+        assert_eq!(transactions_ping_request(7).ping.unwrap().id, 7);
+        assert_eq!(deshred_ping_request(9).ping.unwrap().id, 9);
+    }
+
+    #[test]
+    fn transaction_update_uses_nested_signature_and_wrapper_slot() {
+        let nested = vec![7; 64];
+        let msg = SubscribeUpdateTransaction {
+            transaction: Some(SubscribeUpdateTransactionInfo {
+                signature: vec![9; 64],
+                transaction: Some(transaction(nested)),
+                ..Default::default()
+            }),
+            slot: 42,
+        };
+        assert_eq!(transaction_hit(&msg), Some(([7; 64], 42)));
+    }
+
+    #[test]
+    fn deshred_update_uses_nested_signature_and_wrapper_slot() {
+        let nested = vec![5; 64];
+        let msg = SubscribeUpdateDeshredTransaction {
+            transaction: Some(SubscribeUpdateDeshredTransactionInfo {
+                signature: vec![8; 64],
+                transaction: Some(transaction(nested)),
+                ..Default::default()
+            }),
+            slot: 84,
+        };
+        assert_eq!(deshred_hit(&msg), Some(([5; 64], 84)));
+    }
+
+    #[test]
+    fn malformed_or_absent_nested_signatures_are_ignored() {
+        let malformed = SubscribeUpdateDeshredTransaction {
+            transaction: Some(SubscribeUpdateDeshredTransactionInfo {
+                transaction: Some(transaction(vec![1; 63])),
+                ..Default::default()
+            }),
+            slot: 1,
+        };
+        assert_eq!(deshred_hit(&malformed), None);
+        assert_eq!(
+            transaction_hit(&SubscribeUpdateTransaction::default()),
+            None
+        );
+    }
 }

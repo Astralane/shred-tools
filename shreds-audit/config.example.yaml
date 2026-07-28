@@ -34,7 +34,12 @@ providers:
 # Compare shred delivery against Geyser/Yellowstone gRPC feeds by transaction
 # arrival time:
 # grpc_sources:
-#   - name: my-grpc
+#   - name: regular-geyser
 #     url: "https://grpc.example.com:443"
 #     x_token: "optional-auth-token"
+#     mode: transactions      # default when omitted
 #     commitment: processed   # processed | confirmed | finalized
+#   - name: early-deshred
+#     url: "https://deshred.example.com:443"
+#     x_token: "optional-auth-token"
+#     mode: deshred           # pre-execution; commitment is not supported
