@@ -9,6 +9,7 @@ package geyser;
 
 service Geyser {
   rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeUpdate) {}
+  rpc SubscribeDeshred(stream SubscribeDeshredRequest) returns (stream SubscribeUpdateDeshred) {}
   rpc SubscribeReplayInfo(SubscribeReplayInfoRequest) returns (SubscribeReplayInfoResponse) {}
   rpc Ping(PingRequest) returns (PongResponse) {}
   rpc GetLatestBlockhash(GetLatestBlockhashRequest) returns (GetLatestBlockhashResponse) {}
@@ -46,6 +47,20 @@ message SubscribeRequest {
   repeated SubscribeRequestAccountsDataSlice accounts_data_slice = 7;
   optional SubscribeRequestPing ping = 9;
   optional uint64 from_slot = 11;
+}
+
+// Deshred extension mirrored from ../../proto/geyser.proto. TODO: use a dependency instead.
+message SubscribeDeshredRequest {
+  map<string, SubscribeRequestFilterDeshredTransactions> deshred_transactions = 1;
+  optional SubscribeRequestPing ping = 2;
+  map<string, SubscribeRequestFilterSlots> slots = 3;
+}
+
+message SubscribeRequestFilterDeshredTransactions {
+  optional bool vote = 1;
+  repeated string account_include = 2;
+  repeated string account_exclude = 3;
+  repeated string account_required = 4;
 }
 
 message SubscribeRequestFilterAccounts {
@@ -130,6 +145,32 @@ message SubscribeUpdate {
     SubscribeUpdateEntry entry = 8;
   }
   google.protobuf.Timestamp created_at = 11;
+}
+
+message SubscribeUpdateDeshred {
+  repeated string filters = 1;
+  oneof update_oneof {
+    SubscribeUpdateDeshredTransaction deshred_transaction = 2;
+    SubscribeUpdatePing ping = 3;
+    SubscribeUpdatePong pong = 4;
+    SubscribeUpdateSlot slot = 6;
+  }
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message SubscribeUpdateDeshredTransaction {
+  SubscribeUpdateDeshredTransactionInfo transaction = 1;
+  uint64 slot = 2;
+}
+
+message SubscribeUpdateDeshredTransactionInfo {
+  bytes signature = 1;
+  bool is_vote = 2;
+  solana.storage.ConfirmedBlock.Transaction transaction = 3;
+  repeated bytes loaded_writable_addresses = 4;
+  repeated bytes loaded_readonly_addresses = 5;
+  uint32 completed_data_set_starting_shred_index = 6;
+  uint32 completed_data_set_ending_shred_index_exclusive = 7;
 }
 
 message SubscribeUpdateAccount {

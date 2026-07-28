@@ -19,7 +19,7 @@ use std::{
 use crossbeam_channel::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, GrpcMode};
 use crate::deshred::{is_data_shred_variant, Deshredder, ShredInput};
 use crate::sigreg::{SigRegistry, SourceKind};
 
@@ -73,10 +73,16 @@ impl TxnCompare {
             .spawn(move || run_grpc_runtime(grpc_sources, grpc_reg, grpc_cancel, n_providers))
             .ok();
 
+        let transaction_sources = cfg
+            .grpc_sources
+            .iter()
+            .filter(|g| g.mode == GrpcMode::Transactions)
+            .count();
+        let deshred_sources = cfg.grpc_sources.len() - transaction_sources;
         eprintln!(
             "txn-compare: reconstructing transactions per shred provider and subscribing to {} \
-             gRPC source(s); racing every source by transaction signature",
-            cfg.grpc_sources.len()
+             transaction + {} deshred gRPC source(s); racing every source by transaction signature",
+            transaction_sources, deshred_sources
         );
 
         Some(Self {
