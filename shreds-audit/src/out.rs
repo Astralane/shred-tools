@@ -57,7 +57,64 @@ pub struct Manifest {
     /// declared `grpc_sources`. Null otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txn_compare: Option<TxnCompareSummary>,
+    /// DoubleZero Edge multicast membership, present only when the config
+    /// declared a `multicast` block. Read this before comparing a multicast
+    /// provider against anything: a group that was not joined for the whole
+    /// window did not lose races, it was not in them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multicast: Option<MulticastStatus>,
     pub notes: Vec<String>,
+}
+
+/// Multicast membership over the capture.
+#[derive(Serialize, Clone, Default)]
+pub struct MulticastStatus {
+    pub groups: Vec<MulticastGroupStatus>,
+    /// Membership transitions inside this archive's window, oldest first.
+    pub events: Vec<MulticastEvent>,
+    /// Transitions discarded after the retention cap. Nonzero means the tunnel
+    /// flapped more than the event list can hold; the per-group counters are
+    /// still exact.
+    pub events_dropped: u64,
+}
+
+/// One group's membership state and history.
+#[derive(Serialize, Clone)]
+pub struct MulticastGroupStatus {
+    pub group: String,
+    pub port: u16,
+    /// Interface address the join was made on. `0.0.0.0` means the kernel
+    /// routing table chose it.
+    pub interface: String,
+    pub require_route: bool,
+    /// Joined as of when this manifest was written.
+    pub joined: bool,
+    /// Nanoseconds this group was joined during **this archive's window**, not
+    /// the whole run. Compare it against the window length: anything well short
+    /// of it means the provider on this port was absent for part of the capture,
+    /// and its `missed` and coverage are wrong by that much.
+    pub joined_ns: i64,
+    pub joins: u64,
+    pub leaves: u64,
+    /// `IP_ADD_MEMBERSHIP` failures. A group with errors and no joins never
+    /// delivered a single shred.
+    pub join_errors: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// First successful join, or null if it never joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_joined_at_unix_ns: Option<i64>,
+}
+
+/// A single membership transition.
+#[derive(Serialize, Clone)]
+pub struct MulticastEvent {
+    pub at_unix_ns: i64,
+    pub group: String,
+    /// "join", "leave", or "join_failed".
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Transaction-timing comparison across sources. The reconstructed shred stream

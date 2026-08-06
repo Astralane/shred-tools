@@ -4,6 +4,7 @@ mod deshred;
 mod grpc;
 mod leader;
 mod live;
+mod mcast;
 mod names;
 mod out;
 mod pinger;
@@ -36,6 +37,7 @@ use crate::{
     config::Config,
     leader::LeaderSchedule,
     live::LiveStats,
+    mcast::MembershipLog,
     out::{Archive, Counters, Manifest, TxnCompareSummary},
     pinger::NetMon,
     registry::Registry,
@@ -83,6 +85,19 @@ fn main() -> Result<()> {
         cfg.listen_ports,
         cfg.verify_thread_count()
     );
+    for m in &cfg.multicast {
+        eprintln!(
+            "  multicast port {}: groups {:?} on interface {} ({})",
+            m.port,
+            m.resolved_groups(),
+            m.interface,
+            if m.require_route {
+                "joined once their DoubleZero host route appears"
+            } else {
+                "joined unconditionally (require_route: false)"
+            },
+        );
+    }
 
     let schedule = LeaderSchedule::new(&cfg.rpc_url);
     schedule
@@ -116,13 +131,19 @@ fn main() -> Result<()> {
     // Source IPs per provider (from the rx threads) and their ping RTTs.
     let netmon = Arc::new(pinger::NetMon::new());
 
+    // Multicast group membership, empty and inert unless the config declares a
+    // `multicast` block.
+    let membership = Arc::new(MembershipLog::new());
+
     let _rx_handles = rx::spawn_receivers(
         cfg.bind_ip,
         &cfg.listen_ports,
+        &cfg.multicast,
         registry.clone(),
         netmon.clone(),
         tx,
         rx_stats.clone(),
+        membership.clone(),
         exit.clone(),
     )
     .context("binding sockets")?;
@@ -278,7 +299,7 @@ fn main() -> Result<()> {
         if args.live && last_live.elapsed() >= Duration::from_secs(live_secs) {
             last_live = Instant::now();
             if let Err(e) = write_live_snapshot(
-                &out_dir, &window_rows, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+                &out_dir, &window_rows, &cfg, &registry, &netmon, &membership, &schedule, &rx_stats, &vstats,
                 txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
             ) {
                 let msg = format!("live snapshot failed: {e:#}");
@@ -298,7 +319,7 @@ fn main() -> Result<()> {
             }
             archive.write_sets(&registry, &rows)?;
             let zip = finish_archive(
-                archive, &out_dir, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+                archive, &out_dir, &cfg, &registry, &netmon, &membership, &schedule, &rx_stats, &vstats,
                 txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
             )?;
             if tui.is_some() {
@@ -311,8 +332,10 @@ fn main() -> Result<()> {
             archive_start = out::now_unix_ns();
             work_dir = out_dir.join(format!(".work-{archive_start}"));
             archive = Archive::create(&work_dir, args.dump_shreds)?;
-            // A new window begins; live.zip now tracks it from empty.
+            // A new window begins; live.zip now tracks it from empty, and
+            // multicast joined-time is re-accounted against the new window.
             window_rows.clear();
+            membership.begin_window(archive_start);
         }
     }
 
@@ -346,7 +369,7 @@ fn main() -> Result<()> {
     if args.live {
         window_rows.extend_from_slice(&rows);
         if let Err(e) = write_live_snapshot(
-            &out_dir, &window_rows, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+            &out_dir, &window_rows, &cfg, &registry, &netmon, &membership, &schedule, &rx_stats, &vstats,
             txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
         ) {
             eprintln!("final live snapshot failed: {e:#}");
@@ -354,7 +377,7 @@ fn main() -> Result<()> {
     }
     let bad_data = archive.invalid_data;
     let zip = finish_archive(
-        archive, &out_dir, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats,
+        archive, &out_dir, &cfg, &registry, &netmon, &membership, &schedule, &rx_stats, &vstats,
         txn_snap.as_ref(), aggregator.shreds_after_window(), archive_start,
     )?;
     eprintln!("wrote {}", zip.display());
@@ -381,6 +404,7 @@ fn finish_archive(
     cfg: &Config,
     registry: &Registry,
     netmon: &NetMon,
+    membership: &MembershipLog,
     schedule: &LeaderSchedule,
     rx_stats: &RxStats,
     vstats: &VerifyStats,
@@ -389,8 +413,8 @@ fn finish_archive(
     started_at: i64,
 ) -> Result<PathBuf> {
     let manifest = build_manifest(
-        &archive, cfg, registry, netmon, schedule, rx_stats, vstats, txn, shreds_after_window,
-        started_at,
+        &archive, cfg, registry, netmon, membership, schedule, rx_stats, vstats, txn,
+        shreds_after_window, started_at,
     );
     let name = format!(
         "shred-audit-{}-{}.zip",
@@ -410,6 +434,7 @@ fn write_live_snapshot(
     cfg: &Config,
     registry: &Registry,
     netmon: &NetMon,
+    membership: &MembershipLog,
     schedule: &LeaderSchedule,
     rx_stats: &RxStats,
     vstats: &VerifyStats,
@@ -421,8 +446,8 @@ fn write_live_snapshot(
     let mut a = Archive::create(&work, false)?;
     a.write_sets(registry, rows)?;
     let mut manifest = build_manifest(
-        &a, cfg, registry, netmon, schedule, rx_stats, vstats, txn, shreds_after_window,
-        window_start,
+        &a, cfg, registry, netmon, membership, schedule, rx_stats, vstats, txn,
+        shreds_after_window, window_start,
     );
     manifest.notes.insert(
         0,
@@ -442,6 +467,7 @@ fn build_manifest(
     cfg: &Config,
     registry: &Registry,
     netmon: &NetMon,
+    membership: &MembershipLog,
     schedule: &LeaderSchedule,
     rx_stats: &RxStats,
     vstats: &VerifyStats,
@@ -533,6 +559,14 @@ fn build_manifest(
         notes.extend(onchain_notes(cfg, t));
     }
 
+    // Multicast membership, and the caveats that follow from it. A provider fed
+    // by a group that was not joined has no data for the period it was absent,
+    // and every comparison against it is wrong by exactly that much.
+    let multicast = (!cfg.multicast.is_empty()).then(|| membership.snapshot());
+    if let Some(m) = &multicast {
+        notes.extend(multicast_notes(m, started_at, out::now_unix_ns()));
+    }
+
     Manifest {
         tool: "shred-audit",
         tool_version: VERSION,
@@ -553,6 +587,7 @@ fn build_manifest(
         provider_pings: netmon.provider_pings(cfg, registry),
         leader_names: schedule.leader_names(),
         txn_compare: txn.cloned(),
+        multicast,
         counters: Counters {
             udp_received: rx_stats.received.load(Ordering::Relaxed),
             udp_unmatched: unmatched,
@@ -577,6 +612,80 @@ fn build_manifest(
         },
         notes,
     }
+}
+
+/// Caveats for multicast membership.
+///
+/// A multicast provider can only be compared over the time its groups were
+/// actually joined. Membership is not a detail of the plumbing: while a group is
+/// left, its provider receives nothing, and every set the other providers
+/// delivered in that period counts against it as `missed` and as a set it was
+/// absent for. Presented without this, a DoubleZero tunnel that was down for
+/// half a capture is indistinguishable from a transport that lost half the
+/// races — so say it outright.
+fn multicast_notes(m: &out::MulticastStatus, window_start: i64, now: i64) -> Vec<String> {
+    let mut notes = Vec::new();
+    let window_ns = (now - window_start).max(1);
+
+    let never: Vec<&str> = m
+        .groups
+        .iter()
+        .filter(|g| g.first_joined_at_unix_ns.is_none())
+        .map(|g| g.group.as_str())
+        .collect();
+    if never.len() == m.groups.len() && !never.is_empty() {
+        notes.push(format!(
+            "NO multicast group was ever joined ({}). The provider on those ports received \
+             nothing, so it did not lose any race — it was in none. Check that the DoubleZero \
+             tunnel is up and a /32 host route to each group exists (`ip route get <group>`), or \
+             set `require_route: false` if this deployment installs no such route",
+            never.join(", ")
+        ));
+    } else if !never.is_empty() {
+        notes.push(format!(
+            "multicast group(s) {} were never joined, so nothing arrived from them. Any group \
+             traffic they carry is absent from this archive",
+            never.join(", ")
+        ));
+    }
+
+    for g in &m.groups {
+        if g.join_errors > 0 {
+            notes.push(format!(
+                "multicast group {} failed to join {} time(s) (last: {}). While unjoined it \
+                 delivered nothing",
+                g.group,
+                g.join_errors,
+                g.last_error.as_deref().unwrap_or("unknown"),
+            ));
+        }
+        // Only meaningful for a group that did join at some point; one that never
+        // joined is already covered above.
+        if g.first_joined_at_unix_ns.is_some() {
+            let pct = 100.0 * g.joined_ns as f64 / window_ns as f64;
+            if pct < 99.0 {
+                notes.push(format!(
+                    "multicast group {} was joined for only {:.1}% of this window ({} join(s), {} \
+                     leave(s)). Its provider was absent for the remainder, which inflates that \
+                     provider's `missed` and depresses its coverage for reasons that have nothing \
+                     to do with delivery speed. Compare providers over a window where membership \
+                     was continuous, or restrict the analysis to slots inside the joined intervals \
+                     listed under `multicast.events`",
+                    g.group, pct, g.joins, g.leaves,
+                ));
+            }
+        }
+    }
+
+    if m.events_dropped > 0 {
+        notes.push(format!(
+            "{} multicast membership transition(s) were dropped from `multicast.events` after the \
+             retention cap — the tunnel flapped more than the event list holds. The per-group \
+             `joins`/`leaves`/`joined_ns` counters are still exact",
+            m.events_dropped
+        ));
+    }
+    notes
 }
 
 /// Caveats for the onchain transaction audit. It is a *sample* — one slot every

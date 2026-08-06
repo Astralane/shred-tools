@@ -18,10 +18,47 @@ providers:
     port: 20002
 
 # ---------------------------------------------------------------------------
+# DoubleZero Edge multicast
+# ---------------------------------------------------------------------------
+#
+# To compare DoubleZero Edge against internet turbine on a validator, make each
+# one a provider and add a `multicast` entry for the group port. shred-audit then
+# receives the groups the same way raiku-agave does: it binds 0.0.0.0:7733 with
+# SO_REUSEADDR and joins each group once its DoubleZero host route appears.
+#
+# SO_REUSEADDR is what makes this safe to run next to a live validator. The
+# kernel fans a multicast datagram out to EVERY socket bound to the port, so
+# shred-audit gets its own copy and the validator loses nothing. No mirroring,
+# no extra hop: both legs are stamped by the kernel at driver handoff, so the
+# turbine-vs-DoubleZero delta is an exact subtraction.
+#
+# listen_ports: [7733, 20001]
+# providers:
+#   - name: doublezero
+#     port: 7733
+#   - name: turbine
+#     port: 20001
+# multicast:
+#   - port: 7733             # DoubleZero uses 7733 for every group (default)
+#     cluster: mainnet       # mainnet | testnet -> that cluster's leader + root groups
+#     # groups: ["233.84.178.1", "233.84.178.16"]   # or list them explicitly
+#     # interface: "0.0.0.0"    # 0.0.0.0 lets the DoubleZero host route pick it
+#     # require_route: true     # join only while a /32 host route to the group exists
+#
+# Turbine is the harder leg: agave owns the TVU port, so it cannot be bound
+# twice. Mirror it to a spare port (`tc ... action mirred`) and point the
+# `turbine` provider at that port.
+#
+# After a run, read `multicast` in manifest.json BEFORE comparing anything. A
+# group that was not joined for the whole window did not lose races — it was in
+# none of them, and `joined_ns` says for how long.
+#
+# ---------------------------------------------------------------------------
 # Optional — uncomment and edit only if you need it. Defaults shown.
 # ---------------------------------------------------------------------------
 #
-# bind_ip: "0.0.0.0"        # interface to bind
+# bind_ip: "0.0.0.0"        # interface to bind (ignored for multicast ports,
+#                           # which must bind 0.0.0.0 to receive their groups)
 # output_dir: "./out"       # where archives are written
 # rotate_secs: 600          # new archive every N secs (0 = one archive at exit)
 # shred_version: null       # drop shreds not matching this version (null = all)

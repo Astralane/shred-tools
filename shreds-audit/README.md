@@ -101,6 +101,73 @@ Each provider must set `port`, `ips`, or both — the tool refuses to start on a
 config that could silently drop traffic, so you find mistakes immediately rather
 than in the numbers.
 
+### DoubleZero Edge multicast
+
+A provider can be a multicast group instead of a unicast sender, which is how you
+compare **DoubleZero Edge against internet turbine on a validator**. Add a
+`multicast` entry for the group port and make each transport a provider:
+
+```yaml
+listen_ports: [7733, 20001]
+providers:
+  - name: doublezero
+    port: 7733
+  - name: turbine
+    port: 20001            # a mirror of the validator's TVU port; see below
+multicast:
+  - port: 7733             # DoubleZero uses 7733 for every group
+    cluster: mainnet       # mainnet | testnet -> that cluster's leader + root groups
+```
+
+shred-audit receives the groups exactly the way the validator does: bind
+`0.0.0.0:7733` with `SO_REUSEADDR`, then join each group once the DoubleZero
+daemon has installed its host route.
+
+**You can run this next to a live validator.** For multicast the kernel fans each
+datagram out to *every* socket bound to the port, so shred-audit takes its own
+copy and the validator loses nothing — unlike a unicast port, where a second
+socket would compete for the stream. Nothing is mirrored and no hop is added, so
+the DoubleZero timestamp is the kernel's at driver handoff on the DoubleZero
+interface, directly comparable with a turbine timestamp taken the same way. The
+delta stays an exact subtraction.
+
+| field | meaning |
+|---|---|
+| `port` | UDP port of the groups; must be in `listen_ports`. Defaults to 7733 |
+| `cluster` | `mainnet` / `testnet` — shorthand for that cluster's leader + turbine-root groups |
+| `groups` | explicit group addresses; combines with `cluster` |
+| `interface` | IPv4 of the interface to join on. `0.0.0.0` (default) lets the DoubleZero host route choose it |
+| `require_route` | join only while a `/32` host route to the group exists (default `true`) |
+
+`require_route` is on by default because a join without that route succeeds
+against whatever the default route names and then receives nothing at all — which
+would read as DoubleZero delivering nothing rather than as a tunnel that is down.
+Membership is re-checked every 60 s, so a tunnel that flaps mid-capture is
+followed rather than lost. Set it to `false` only if your deployment installs no
+such route.
+
+**Turbine is the harder leg.** Agave owns the TVU port, so it cannot be bound
+twice — and `SO_REUSEPORT` would make the kernel *split* the stream with the
+validator rather than duplicate it. Mirror that port to a spare one and point the
+`turbine` provider there:
+
+```sh
+tc qdisc add dev eth0 clsact
+tc filter add dev eth0 ingress protocol ip flower ip_proto udp dst_port <TVU_PORT> \
+   action mirred egress mirror dev <spare-veth>
+```
+
+`mirred ... mirror` clones, so the validator's own path is untouched. A mirror
+costs the turbine leg a small extra hop that the multicast leg does not pay, so it
+biases turbine *slower*; measure it once and subtract, or mirror both legs the
+same way if you want the bias to cancel exactly. Mirror drops are invisible to
+this tool — check `tc -s filter show` too, or they read as turbine packet loss.
+
+**Read `multicast` in `manifest.json` before comparing anything.** A group that
+was not joined for the whole window did not lose races, it was in none of them;
+`joined_ns` says for how long it was in, `joins`/`leaves` how often the tunnel
+flapped, and the `notes` say so in words when the window is not trustworthy.
+
 > **Keep your `config.yaml` private.** It can contain gRPC auth tokens. Only
 > `config.example.yaml` is meant to be shared; `config.yaml` is gitignored.
 
@@ -182,7 +249,9 @@ Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:
 
 - **`manifest.json`** — details about the run, plus a **`notes`** section listing
   any data-quality caveats. **Always read the notes** — they tell you if a
-  capture was incomplete before you draw conclusions from it.
+  capture was incomplete before you draw conclusions from it. With a `multicast`
+  block there is also a **`multicast`** section: per group, whether it was joined,
+  `joined_ns` (how much of the window it was in), and every join/leave transition.
 - **`fec_sets.parquet`** — one row per (provider, slot, FEC set) with timing,
   delivery counts, and validity. This is the table you compare providers on.
 - **`shreds.parquet`** — one row per shred, only present if you passed

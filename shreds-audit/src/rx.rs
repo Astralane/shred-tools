@@ -27,6 +27,8 @@ use crossbeam_channel::Sender;
 
 use ahash::AHashSet;
 
+use crate::config::MulticastCfg;
+use crate::mcast::MembershipLog;
 use crate::pinger::NetMon;
 use crate::registry::{ProviderId, Registry};
 
@@ -72,20 +74,58 @@ pub struct RxStats {
     pub truncated: AtomicU64,
 }
 
-/// Bind one UDP socket per port and spawn a receive thread for each.
+/// Bind one UDP socket per port and spawn a receive thread for each. Ports that
+/// a `multicast` entry covers also get a membership thread.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_receivers(
     bind_ip: Ipv4Addr,
     ports: &[u16],
+    multicast: &[MulticastCfg],
     registry: Arc<Registry>,
     netmon: Arc<NetMon>,
     tx: Sender<Vec<Packet>>,
     stats: Arc<RxStats>,
+    membership: Arc<MembershipLog>,
     exit: Arc<AtomicBool>,
 ) -> Result<Vec<std::thread::JoinHandle<()>>> {
     let mut handles = Vec::with_capacity(ports.len());
     for &port in ports {
-        let sock = bind_socket(bind_ip, port)
-            .with_context(|| format!("binding {bind_ip}:{port}"))?;
+        let mcast = multicast.iter().find(|m| m.port == port);
+        // A multicast socket must be bound to INADDR_ANY: binding it to a single
+        // local address filters out the group traffic, and binding it to the
+        // group address would restrict the socket to one group. `bind_ip` is
+        // therefore deliberately ignored here.
+        let ip = if mcast.is_some() {
+            if !bind_ip.is_unspecified() {
+                eprintln!(
+                    "note: port {port} is a multicast port, binding it to 0.0.0.0 rather than \
+                     {bind_ip} — a multicast socket bound to one local address receives no groups"
+                );
+            }
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            bind_ip
+        };
+
+        let sock = Arc::new(bind_socket(ip, port, mcast.is_some()).with_context(|| {
+            if mcast.is_some() {
+                format!("binding multicast {ip}:{port}")
+            } else {
+                format!(
+                    "binding {ip}:{port} (if a local process already owns this port — the \
+                     validator's own multicast receive socket, say — declare it under `multicast` \
+                     so it is bound with SO_REUSEADDR)"
+                )
+            }
+        })?);
+
+        if let Some(m) = mcast {
+            handles.push(
+                crate::mcast::spawn_membership(sock.clone(), m, membership.clone(), exit.clone())
+                    .with_context(|| format!("starting multicast membership for port {port}"))?,
+            );
+        }
+
         let registry = registry.clone();
         let netmon = netmon.clone();
         let tx = tx.clone();
@@ -100,7 +140,7 @@ pub fn spawn_receivers(
     Ok(handles)
 }
 
-struct Socket(RawFd);
+pub struct Socket(RawFd);
 impl AsRawFd for Socket {
     fn as_raw_fd(&self) -> RawFd {
         self.0
@@ -112,7 +152,7 @@ impl Drop for Socket {
     }
 }
 
-fn bind_socket(ip: Ipv4Addr, port: u16) -> Result<Socket> {
+fn bind_socket(ip: Ipv4Addr, port: u16, multicast: bool) -> Result<Socket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {
@@ -121,6 +161,30 @@ fn bind_socket(ip: Ipv4Addr, port: u16) -> Result<Socket> {
         let sock = Socket(fd);
 
         let on: libc::c_int = 1;
+
+        // SO_REUSEADDR, before the bind, for multicast ports only.
+        //
+        // This is what lets shred-audit share a group port with the validator's
+        // own receive socket. For multicast the kernel *fans out* each datagram
+        // to every socket bound to the port, so both get a full copy and the
+        // validator loses nothing — the same reason raiku-agave sets it. It is
+        // deliberately NOT set on unicast ports: there the semantics are about
+        // rebinding, not duplication, and quietly enabling it would let two
+        // sockets contend for one stream and split it.
+        if multicast
+            && libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &on as *const _ as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) < 0
+        {
+            return Err(anyhow::anyhow!(
+                "setsockopt(SO_REUSEADDR) failed on multicast port {port}: {}",
+                io::Error::last_os_error()
+            ));
+        }
         // Ask the kernel to attach a CLOCK_REALTIME timespec to every datagram.
         if libc::setsockopt(
             fd,
@@ -271,7 +335,7 @@ impl RecvArena {
 }
 
 fn rx_loop(
-    sock: Socket,
+    sock: Arc<Socket>,
     port: u16,
     registry: Arc<Registry>,
     netmon: Arc<NetMon>,

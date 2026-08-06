@@ -37,6 +37,13 @@ pub struct Config {
     #[serde(default)]
     pub shred_version: Option<u16>,
 
+    /// IPv4 multicast groups to receive on — DoubleZero Edge shreds. Each entry
+    /// covers one of the `listen_ports`; that port's socket is bound with
+    /// `SO_REUSEADDR` and joins the groups as their DoubleZero routes appear.
+    /// Empty means no multicast, and the tool behaves exactly as before.
+    #[serde(default)]
+    pub multicast: Vec<MulticastCfg>,
+
     /// With `--live`, how often (seconds) to refresh the stable `live.zip`
     /// snapshot of the current window. 0 falls back to 10.
     #[serde(default = "default_live_secs")]
@@ -101,6 +108,78 @@ fn default_onchain_lag_slots() -> u64 {
 /// hour, which is far more than the rates need to settle.
 fn default_onchain_sample_secs() -> u64 {
     5
+}
+
+/// One multicast port and the groups to join on it.
+///
+/// Modelled on raiku-agave's `--multicast-shred-receiver*` flags: the socket
+/// binds `0.0.0.0:port` (never a group address, so several groups can share it)
+/// and membership is managed separately, gated on the DoubleZero host route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MulticastCfg {
+    /// UDP port the groups deliver to. Must appear in `listen_ports`.
+    /// DoubleZero uses 7733 for every group.
+    #[serde(default = "default_multicast_port")]
+    pub port: u16,
+
+    /// Groups to join. May be combined with `cluster`; the union is used.
+    #[serde(default)]
+    pub groups: Vec<Ipv4Addr>,
+
+    /// Shorthand for a cluster's leader + turbine-root groups, so the well-known
+    /// addresses do not have to be copied into every config.
+    #[serde(default)]
+    pub cluster: Option<McastCluster>,
+
+    /// IPv4 address of the interface to join on. `0.0.0.0` lets the kernel
+    /// routing table pick, which resolves to the DoubleZero interface via the
+    /// host route its daemon installs — the same default agave uses.
+    #[serde(default = "default_bind_ip")]
+    pub interface: Ipv4Addr,
+
+    /// Join a group only while a /32 host route to it exists. On by default
+    /// because joining without one succeeds against whatever the default route
+    /// names and then receives nothing at all — which reads as DoubleZero
+    /// delivering nothing rather than as a tunnel that is down.
+    #[serde(default = "default_true")]
+    pub require_route: bool,
+}
+
+/// Clusters with well-known DoubleZero multicast groups.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McastCluster {
+    Mainnet,
+    Testnet,
+}
+
+impl McastCluster {
+    /// `(leader_broadcast, turbine_root)` for this cluster.
+    fn groups(self) -> [Ipv4Addr; 2] {
+        match self {
+            Self::Mainnet => [crate::mcast::MAINNET_LEADER_GROUP, crate::mcast::MAINNET_ROOT_GROUP],
+            Self::Testnet => [crate::mcast::TESTNET_LEADER_GROUP, crate::mcast::TESTNET_ROOT_GROUP],
+        }
+    }
+}
+
+impl MulticastCfg {
+    /// Every group this entry covers: the cluster's well-known pair plus any
+    /// explicit ones, deduplicated and in a stable order.
+    pub fn resolved_groups(&self) -> Vec<Ipv4Addr> {
+        let mut out: Vec<Ipv4Addr> = Vec::new();
+        let from_cluster = self.cluster.map(McastCluster::groups);
+        for ip in from_cluster.iter().flatten().chain(self.groups.iter()) {
+            if !out.contains(ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
+}
+
+fn default_multicast_port() -> u16 {
+    crate::mcast::DEFAULT_MULTICAST_SHRED_PORT
 }
 
 /// A Geyser gRPC transaction feed for the shred-vs-gRPC timing comparison.
@@ -215,6 +294,58 @@ impl Config {
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             bail!("config: duplicate provider names");
+        }
+
+        // Multicast is validated strictly for the same reason provider rules are:
+        // every one of these mistakes ends in a socket that receives nothing,
+        // which is indistinguishable in the output from a transport that
+        // delivered nothing.
+        let mut seen_ports = std::collections::HashSet::new();
+        for m in &self.multicast {
+            if !self.listen_ports.contains(&m.port) {
+                bail!(
+                    "multicast port {} is not in `listen_ports` {:?} — no socket would ever be \
+                     bound for it",
+                    m.port,
+                    self.listen_ports
+                );
+            }
+            if !seen_ports.insert(m.port) {
+                bail!(
+                    "config: two `multicast` entries both claim port {} — one socket is bound per \
+                     port, so list every group for it in a single entry",
+                    m.port
+                );
+            }
+            let groups = m.resolved_groups();
+            if groups.is_empty() {
+                bail!(
+                    "multicast entry for port {} declares no groups — set `groups`, `cluster`, or \
+                     both",
+                    m.port
+                );
+            }
+            for g in &groups {
+                if !g.is_multicast() {
+                    bail!(
+                        "multicast group {g} on port {} is not an IPv4 multicast address \
+                         (224.0.0.0/4)",
+                        m.port
+                    );
+                }
+            }
+            // A provider must own the port outright. Matching a multicast port by
+            // source IP would mean enumerating every leader that broadcasts on
+            // the group, and any leader missed from that list would have its
+            // shreds silently counted as unmatched.
+            if !self.providers.iter().any(|p| p.port == Some(m.port)) {
+                bail!(
+                    "no provider is pinned to multicast port {} — add `- name: doublezero` with \
+                     `port: {}` so its shreds are attributed instead of counted as unmatched",
+                    m.port,
+                    m.port
+                );
+            }
         }
 
         let mut grpc_names = std::collections::HashSet::new();
@@ -425,6 +556,158 @@ onchain_rpc_url: http://my-node:8899
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.effective_onchain_rpc_url(), "http://my-node:8899");
+    }
+
+    /// The DoubleZero setup from the README, end to end.
+    #[test]
+    fn a_cluster_shorthand_expands_to_the_leader_and_root_groups() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [7733, 20001]
+providers:
+  - name: doublezero
+    port: 7733
+  - name: turbine
+    port: 20001
+multicast:
+  - port: 7733
+    cluster: mainnet
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let m = &cfg.multicast[0];
+        assert_eq!(
+            m.resolved_groups(),
+            vec![crate::mcast::MAINNET_LEADER_GROUP, crate::mcast::MAINNET_ROOT_GROUP]
+        );
+        assert!(m.require_route, "route gating is the safe default");
+        assert!(m.interface.is_unspecified(), "let the DZ host route pick the interface");
+    }
+
+    /// `cluster` and `groups` compose, and a group named twice is joined once.
+    #[test]
+    fn explicit_groups_merge_with_the_cluster_shorthand_without_duplicating() {
+        let yaml = r#"
+rpc_url: http://localhost:8899
+listen_ports: [7733]
+providers:
+  - name: doublezero
+    port: 7733
+multicast:
+  - port: 7733
+    cluster: mainnet
+    groups: ["233.84.178.1", "233.84.178.99"]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let groups = cfg.multicast[0].resolved_groups();
+        assert_eq!(groups.len(), 3, "the repeated leader group is not joined twice");
+        assert!(groups.contains(&"233.84.178.99".parse().unwrap()));
+    }
+
+    fn multicast_cfg(listen: &str, providers: &str, multicast: &str) -> Result<Config> {
+        let yaml = format!(
+            r#"
+rpc_url: http://localhost:8899
+listen_ports: {listen}
+providers:
+{providers}
+multicast:
+{multicast}
+"#
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// A multicast port nothing binds receives nothing, and the output would show
+    /// that as DoubleZero delivering nothing. Fail at startup instead.
+    #[test]
+    fn a_multicast_port_outside_listen_ports_is_rejected() {
+        let err = multicast_cfg(
+            "[20001]",
+            "  - name: turbine\n    port: 20001",
+            "  - port: 7733\n    cluster: mainnet",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not in `listen_ports`"));
+    }
+
+    /// Only one socket is bound per port, so a second entry for it would have its
+    /// groups silently dropped.
+    #[test]
+    fn two_multicast_entries_for_one_port_are_rejected() {
+        let err = multicast_cfg(
+            "[7733]",
+            "  - name: doublezero\n    port: 7733",
+            "  - port: 7733\n    groups: [\"233.84.178.1\"]\n  - port: 7733\n    groups: [\"233.84.178.16\"]",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("both claim port 7733"));
+    }
+
+    #[test]
+    fn a_multicast_entry_with_no_groups_is_rejected() {
+        let err = multicast_cfg(
+            "[7733]",
+            "  - name: doublezero\n    port: 7733",
+            "  - port: 7733",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("declares no groups"));
+    }
+
+    /// A unicast address in a multicast block never receives group traffic.
+    #[test]
+    fn a_non_multicast_group_address_is_rejected() {
+        let err = multicast_cfg(
+            "[7733]",
+            "  - name: doublezero\n    port: 7733",
+            "  - port: 7733\n    groups: [\"10.0.0.1\"]",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not an IPv4 multicast address"));
+    }
+
+    /// Without a provider pinned to the port, every multicast shred lands in
+    /// `udp_unmatched` — received, verified, and then thrown away.
+    #[test]
+    fn a_multicast_port_with_no_provider_is_rejected() {
+        let err = multicast_cfg(
+            "[7733, 20001]",
+            "  - name: turbine\n    port: 20001",
+            "  - port: 7733\n    cluster: mainnet",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no provider is pinned to multicast port 7733"));
+    }
+
+    /// The port defaults to DoubleZero's 7733 so it need not be repeated.
+    #[test]
+    fn the_multicast_port_defaults_to_the_doublezero_shred_port() {
+        let cfg = multicast_cfg(
+            "[7733]",
+            "  - name: doublezero\n    port: 7733",
+            "  - cluster: testnet",
+        )
+        .unwrap();
+        assert_eq!(cfg.multicast[0].port, crate::mcast::DEFAULT_MULTICAST_SHRED_PORT);
+        assert_eq!(
+            cfg.multicast[0].resolved_groups(),
+            vec![crate::mcast::TESTNET_LEADER_GROUP, crate::mcast::TESTNET_ROOT_GROUP]
+        );
+    }
+
+    /// No `multicast` block must leave everything exactly as it was.
+    #[test]
+    fn multicast_is_absent_by_default() {
+        let cfg = parse(
+            r#"  - name: legacy
+    url: http://localhost:10000"#,
+        )
+        .unwrap();
+        assert!(cfg.multicast.is_empty());
     }
 
     #[test]
