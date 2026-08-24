@@ -39,6 +39,7 @@ const MAX_PLAUSIBLE_SLOT: u64 = 1 << 40;
 pub struct FecShred {
     pub provider_id: u32,
     pub rx: Instant,
+    pub rx_ns: u64,
     pub shred: Bytes,
 }
 
@@ -61,9 +62,13 @@ struct ProviderFec {
     coding_pos: u128,
     invalid: u32,
     duplicate: u32,
-    first: Option<Instant>,
-    last: Option<Instant>,
-    decode: Option<Instant>,
+    // (Instant, unix epoch ns) pairs, captured together at receive time.
+    // Instant remains the sole ordering/comparison key everywhere (it's
+    // monotonic; wall-clock isn't), the ns half just rides along for
+    // absolute reporting.
+    first: Option<(Instant, u64)>,
+    last: Option<(Instant, u64)>,
+    decode: Option<(Instant, u64)>,
 }
 
 impl ProviderFec {
@@ -136,6 +141,9 @@ struct Row {
     decode_ns: Option<i64>,
     #[serde(rename = "fec_last_shred_delay_ns")]
     last_ns: Option<i64>,
+    first_shred_ts_ns: Option<u64>,
+    decode_ts_ns: Option<u64>,
+    last_shred_ts_ns: Option<u64>,
     #[serde(rename = "invalid_shreds")]
     invalid: u32,
     #[serde(rename = "missed_shreds")]
@@ -358,6 +366,7 @@ impl Monitor {
 
         let num_data = set.num_data;
         let rx = item.rx;
+        let rx_ns = item.rx_ns;
         let h = fast_hash(s);
         let e = set.providers.entry(item.provider_id).or_default();
 
@@ -389,12 +398,12 @@ impl Monitor {
                 e.coding_pos |= 1u128 << position;
             }
         }
-        e.first = Some(min_instant(e.first, rx));
-        e.last = Some(max_instant(e.last, rx));
+        e.first = Some(min_pair(e.first, (rx, rx_ns)));
+        e.last = Some(max_pair(e.last, (rx, rx_ns)));
         if e.decode.is_none() {
             if let Some(nd) = num_data {
                 if e.delivered() >= nd as u32 {
-                    e.decode = Some(rx);
+                    e.decode = Some((rx, rx_ns));
                 }
             }
         }
@@ -463,22 +472,24 @@ fn finalize_set(
     } else {
         None
     };
-    let base_first = baseline.and_then(|b| b.first);
+    let base_first = baseline.and_then(|b| b.first).map(|(t, _)| t);
     let anchor_first = match base_first.or(set.earliest_valid) {
         Some(t) => t,
         None => return,
     };
     let anchor_decode = baseline
         .and_then(|b| b.decode)
-        .or_else(|| earliest(set.providers.values().filter_map(|p| p.decode)));
+        .map(|(t, _)| t)
+        .or_else(|| earliest(set.providers.values().filter_map(|p| p.decode.map(|(t, _)| t))));
     let anchor_last = baseline
         .and_then(|b| b.last)
-        .or_else(|| earliest(set.providers.values().filter_map(|p| p.last)));
+        .map(|(t, _)| t)
+        .or_else(|| earliest(set.providers.values().filter_map(|p| p.last.map(|(t, _)| t))));
 
     let winner = set
         .providers
         .iter()
-        .filter_map(|(id, e)| e.first.map(|t| (*id, t)))
+        .filter_map(|(id, e)| e.first.map(|(t, _)| (*id, t)))
         .min_by_key(|(_, t)| *t)
         .map(|(id, _)| id);
     if let Some(p) = winner.and_then(|id| metrics.provider(id)) {
@@ -486,7 +497,7 @@ fn finalize_set(
     }
 
     for (provider_id, e) in set.providers.iter() {
-        if let (Some(first), Some(p)) = (e.first, metrics.provider(*provider_id)) {
+        if let (Some((first, _)), Some(p)) = (e.first, metrics.provider(*provider_id)) {
             p.first_shred_delay_ns
                 .observe(signed_delta(first, anchor_first) as f64);
         }
@@ -498,9 +509,12 @@ fn finalize_set(
             provider_id: *provider_id,
             slot,
             fec_set_index: fec,
-            first_ns: e.first.map(|t| signed_delta(t, anchor_first)),
-            decode_ns: e.decode.zip(anchor_decode).map(|(t, a)| signed_delta(t, a)),
-            last_ns: e.last.zip(anchor_last).map(|(t, a)| signed_delta(t, a)),
+            first_ns: e.first.map(|(t, _)| signed_delta(t, anchor_first)),
+            decode_ns: e.decode.zip(anchor_decode).map(|((t, _), a)| signed_delta(t, a)),
+            last_ns: e.last.zip(anchor_last).map(|((t, _), a)| signed_delta(t, a)),
+            first_shred_ts_ns: e.first.map(|(_, ns)| ns),
+            decode_ts_ns: e.decode.map(|(_, ns)| ns),
+            last_shred_ts_ns: e.last.map(|(_, ns)| ns),
             invalid: e.invalid,
             missed,
             duplicated: e.duplicate,
@@ -585,10 +599,21 @@ fn min_instant(cur: Option<Instant>, t: Instant) -> Instant {
     }
 }
 
+// Same as min_instant, but carrying the paired wall-clock ns
+// value along with whichever Instant wins the comparison, so the two never
+// drift apart from different receive events.
 #[inline]
-fn max_instant(cur: Option<Instant>, t: Instant) -> Instant {
+fn min_pair(cur: Option<(Instant, u64)>, t: (Instant, u64)) -> (Instant, u64) {
     match cur {
-        Some(c) if c >= t => c,
+        Some(c) if c.0 <= t.0 => c,
+        _ => t,
+    }
+}
+
+#[inline]
+fn max_pair(cur: Option<(Instant, u64)>, t: (Instant, u64)) -> (Instant, u64) {
+    match cur {
+        Some(c) if c.0 >= t.0 => c,
         _ => t,
     }
 }

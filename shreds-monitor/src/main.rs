@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
                 let msg = FecShred {
                     provider_id,
                     rx: pkt.received_at,
+                    rx_ns: pkt.received_at_ns,
                     shred: Bytes::from(pkt.data),
                 };
                 if fec_tx.try_send(msg).is_err() {

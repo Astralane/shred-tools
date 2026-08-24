@@ -1,6 +1,6 @@
 use std::{
     net::UdpSocket,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::mpsc;
@@ -9,6 +9,18 @@ use tokio_util::sync::CancellationToken;
 pub struct ShredPacket {
     pub data: Vec<u8>,
     pub received_at: Instant,
+    /// Wall-clock receive time, unix epoch nanoseconds. Captured alongside
+    /// `received_at` so absolute reporting (fec_stats' *_ts_ns columns)
+    /// doesn't depend on the monotonic-only Instant used for delta/ordering
+    /// logic elsewhere.
+    pub received_at_ns: u64,
+}
+
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 pub struct UdpReceiver {
@@ -38,6 +50,7 @@ impl UdpReceiver {
                     let packet = ShredPacket {
                         data: buf[..n].to_vec(),
                         received_at: Instant::now(),
+                        received_at_ns: now_unix_ns(),
                     };
                     if tx.send(packet).is_err() {
                         break;

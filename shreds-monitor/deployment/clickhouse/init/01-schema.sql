@@ -13,6 +13,18 @@ create table if not exists fec_stats
     fec_first_shred_delay_ns Nullable(Int64),
     fec_decode_delay_ns      Nullable(Int64),
     fec_last_shred_delay_ns  Nullable(Int64),
+    -- Absolute wall-clock arrival times (unix epoch nanoseconds), independent
+    -- of whichever provider happens to be the configured baseline. The delta
+    -- columns above remain for backward compatibility with the shipped
+    -- Grafana dashboards; new consumers doing cross-provider or block-level
+    -- math (e.g. a block_reconstruction rollup) should use these instead,
+    -- since deltas alone can't recover per-provider absolute timing without
+    -- also knowing the baseline provider's absolute time for the same set.
+    -- Nullable for the same reason the delta columns are: a provider may
+    -- never reach decode (or ever get its first/last shred) for a given set.
+    first_shred_ts_ns        Nullable(UInt64),
+    decode_ts_ns             Nullable(UInt64),
+    last_shred_ts_ns         Nullable(UInt64),
     invalid_shreds           UInt32,
     missed_shreds            UInt32,
     duplicated_shreds        UInt32,
