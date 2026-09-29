@@ -1,9 +1,4 @@
-//! Leader schedule, fetched over JSON-RPC and cached per epoch.
-//!
-//! Without this we cannot verify a signature at all: the signature on a shred
-//! is made by the slot's leader, so `slot -> leader pubkey` is the only thing
-//! that turns "this is a well-formed shred" into "this is a shred the leader
-//! actually signed".
+//! Leader schedule (slot -> leader pubkey), fetched over JSON-RPC per epoch.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -14,12 +9,7 @@ use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::names;
-
-#[derive(Deserialize)]
-struct RpcResp<T> {
-    result: Option<T>,
-    error: Option<serde_json::Value>,
-}
+use crate::rpc::RpcEndpoint;
 
 #[derive(Deserialize)]
 struct EpochInfo {
@@ -32,50 +22,45 @@ struct EpochInfo {
     epoch: u64,
 }
 
-/// Mainnet epoch length. Only used as a floor for the plausibility window, so a
-/// short (test) schedule still admits the slots around it.
+/// Floor for the plausibility window, so a short (test) schedule still admits nearby slots.
 const SLOTS_PER_EPOCH: u64 = 432_000;
 
-/// What the schedule can say about a slot.
 pub enum SlotVerdict {
     /// Far enough outside the loaded schedule that the datagram is not a shred.
     Implausible,
-    /// The slot's leader.
     Leader(Pubkey),
-    /// A plausible slot the schedule has no entry for. Callers must treat this
-    /// as "cannot verify", never as "invalid".
+    /// Plausible but not in the schedule: "cannot verify", never "invalid".
     Unknown,
 }
 
 struct Epoch {
     epoch: u64,
     first_slot: u64,
-    /// One entry per slot in the epoch. `None` where the RPC gave us nothing.
     leaders: Vec<Option<Pubkey>>,
 }
 
 pub struct LeaderSchedule {
-    rpc_url: String,
+    rpc: RpcEndpoint,
     inner: RwLock<Option<Epoch>>,
-    /// validator identity pubkey -> display name, from on-chain validator-info.
-    /// Empty until `refresh_names` succeeds; names are optional throughout.
+    /// Identity pubkey -> display name; empty until `refresh_names` succeeds.
     names: RwLock<AHashMap<Pubkey, String>>,
 }
 
 impl LeaderSchedule {
-    pub fn new(rpc_url: &str) -> Arc<Self> {
+    pub fn new(rpc: RpcEndpoint) -> Arc<Self> {
         Arc::new(Self {
-            rpc_url: rpc_url.to_string(),
+            rpc,
             inner: RwLock::new(None),
             names: RwLock::new(AHashMap::new()),
         })
     }
 
-    /// Build a schedule with a fixed mapping, bypassing RPC. Test-only.
     #[cfg(test)]
     pub fn for_test(first_slot: u64, leaders: Vec<Option<Pubkey>>) -> Arc<Self> {
         Arc::new(Self {
-            rpc_url: String::new(),
+            rpc: crate::rpc::RpcCfg::generic("http://unused")
+                .resolve()
+                .unwrap(),
             inner: RwLock::new(Some(Epoch {
                 epoch: 0,
                 first_slot,
@@ -85,8 +70,6 @@ impl LeaderSchedule {
         })
     }
 
-    /// Fetch validator display names. Best-effort: the caller logs and continues
-    /// on error, names stay absent.
     pub fn refresh_names(&self) -> Result<()> {
         let map = names::fetch_validator_names()?;
         let n = map.len();
@@ -95,44 +78,28 @@ impl LeaderSchedule {
         Ok(())
     }
 
-    /// `pubkey string -> name` for the distinct leaders in the current epoch
-    /// that published a name. Shaped for direct embedding in the manifest.
+    /// `pubkey -> name` for the named leaders of the current epoch.
     pub fn leader_names(&self) -> HashMap<String, String> {
         let names = self.names.read().unwrap();
-        if names.is_empty() {
-            return HashMap::new();
-        }
         let guard = self.inner.read().unwrap();
         let Some(e) = guard.as_ref() else {
             return HashMap::new();
         };
-        let mut distinct: AHashSet<Pubkey> = AHashSet::new();
-        for l in e.leaders.iter().flatten() {
-            distinct.insert(*l);
-        }
+        let distinct: AHashSet<Pubkey> = e.leaders.iter().flatten().copied().collect();
         distinct
             .into_iter()
             .filter_map(|pk| names.get(&pk).map(|name| (pk.to_string(), name.clone())))
             .collect()
     }
 
-    /// What we can say about `slot`, in one lock acquisition.
     pub fn classify(&self, slot: u64) -> SlotVerdict {
-        let Ok(guard) = self.inner.read() else {
-            return SlotVerdict::Unknown;
-        };
+        let guard = self.inner.read().unwrap();
         let Some(e) = guard.as_ref() else {
             return SlotVerdict::Unknown;
         };
 
-        // A slot an epoch or more outside the schedule we hold is not a shred we
-        // have the wrong leader for — it is not a shred. Some datagrams happen to
-        // carry the shred kind bits and parse into a nonsense slot; attributing
-        // one to a FEC set invents a phantom row and drags the archive's slot
-        // range (and the refresh trigger that reads it) off to u64 nonsense.
-        // The window is deliberately loose — a full epoch below and two above —
-        // so a genuine shred near an epoch boundary is never discarded here. It
-        // simply lands in `Unknown` and is reported as unverifiable, as before.
+        // Non-shred datagrams can parse into nonsense slots. The window (an epoch
+        // below, two above) is loose so real shreds near a boundary become `Unknown`.
         let span = (e.leaders.len() as u64).max(SLOTS_PER_EPOCH);
         let lo = e.first_slot.saturating_sub(span);
         let hi = e.first_slot.saturating_add(span.saturating_mul(2));
@@ -140,11 +107,10 @@ impl LeaderSchedule {
             return SlotVerdict::Implausible;
         }
 
-        if slot < e.first_slot {
-            return SlotVerdict::Unknown;
-        }
-        let idx = (slot - e.first_slot) as usize;
-        match e.leaders.get(idx).copied().flatten() {
+        let leader = slot
+            .checked_sub(e.first_slot)
+            .and_then(|idx| e.leaders.get(idx as usize).copied().flatten());
+        match leader {
             Some(pk) => SlotVerdict::Leader(pk),
             None => SlotVerdict::Unknown,
         }
@@ -152,17 +118,14 @@ impl LeaderSchedule {
 
     /// True when `slot` falls outside the epoch we currently hold.
     pub fn needs_refresh(&self, slot: u64) -> bool {
-        match self.inner.read() {
-            Ok(g) => match g.as_ref() {
-                None => true,
-                Some(e) => slot < e.first_slot || slot >= e.first_slot + e.leaders.len() as u64,
-            },
-            Err(_) => true,
+        match self.inner.read().unwrap().as_ref() {
+            None => true,
+            Some(e) => slot < e.first_slot || slot >= e.first_slot + e.leaders.len() as u64,
         }
     }
 
     pub fn epoch(&self) -> Option<u64> {
-        self.inner.read().ok()?.as_ref().map(|e| e.epoch)
+        self.inner.read().unwrap().as_ref().map(|e| e.epoch)
     }
 
     pub fn refresh(&self) -> Result<()> {
@@ -171,22 +134,11 @@ impl LeaderSchedule {
             .context("getEpochInfo")?;
         let first_slot = info.absolute_slot - info.slot_index;
 
-        // Pin the schedule to the slot we just learned about, rather than asking
-        // for "the current epoch" a second time.
-        //
-        // `getEpochInfo` and `getLeaderSchedule` are two separate requests, and a
-        // public endpoint is a load balancer: they can land on different backends.
-        // Ask for "current" twice across an epoch boundary and one node answers
-        // for epoch N while the other answers for N+1 — we would then index a
-        // schedule from one epoch with a first_slot from the other, get the wrong
-        // leader for *every* slot, and report every shred from every provider as a
-        // bad signature. Passing the slot makes both answers refer to the same
-        // epoch by construction.
-        let raw: std::collections::HashMap<String, Vec<u64>> = self
-            .rpc(
-                "getLeaderSchedule",
-                serde_json::json!([info.absolute_slot]),
-            )
+        // Ask for the schedule at this exact slot, not "current": behind a load
+        // balancer the two calls can straddle an epoch boundary and pair a schedule
+        // with the wrong first_slot, making every signature look bad.
+        let raw: HashMap<String, Vec<u64>> = self
+            .rpc("getLeaderSchedule", serde_json::json!([info.absolute_slot]))
             .context("getLeaderSchedule")?;
 
         let mut leaders = vec![None; info.slots_in_epoch as usize];
@@ -205,10 +157,7 @@ impl LeaderSchedule {
         if placed == 0 {
             return Err(anyhow!("leader schedule came back empty"));
         }
-        // A complete schedule names a leader for every slot of the epoch. If it
-        // does not, the schedule and the epoch we sized it against disagree —
-        // exactly the mismatch that would silently hand us the wrong leader — so
-        // refuse to pretend the gap is a normal schedule gap.
+        // A gap means the schedule and epoch info disagree, i.e. likely the wrong epoch.
         if placed != info.slots_in_epoch as usize {
             return Err(anyhow!(
                 "leader schedule covers {placed} of {} slots in epoch {} — the schedule and the \
@@ -232,17 +181,8 @@ impl LeaderSchedule {
     }
 
     fn rpc<T: for<'de> Deserialize<'de>>(&self, method: &str, params: serde_json::Value) -> Result<T> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-        });
-        let resp: RpcResp<T> = ureq::post(&self.rpc_url)
-            .set("content-type", "application/json")
-            .timeout(std::time::Duration::from_secs(30))
-            .send_json(body)?
-            .into_json()?;
-        if let Some(err) = resp.error {
-            return Err(anyhow!("rpc {method} error: {err}"));
-        }
-        resp.result.ok_or_else(|| anyhow!("rpc {method}: empty result"))
+        self.rpc
+            .call(method, params, std::time::Duration::from_secs(30))
+            .map_err(|e| anyhow!("rpc {method}: {e:#}"))
     }
 }

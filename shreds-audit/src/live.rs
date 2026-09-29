@@ -1,32 +1,17 @@
-//! Live, in-memory provider comparison for the `--tui` dashboard.
-//!
-//! Consumes finalized `SetRow`s as harvested and accumulates, per provider, the
-//! same head-to-head numbers the offline viewer computes — winrate, mean
-//! microseconds behind the fastest, and coverage — cumulatively over the run.
-//!
-//! Keeps no per-set history: O(providers) memory, O(1) per set, so it runs for
-//! days without growing. Reports *comparison only* — invalid / bad-signature /
-//! bad-data counts are never surfaced here; those belong to the archive and
-//! offline viewer. A live glance is for "who is fastest", not for accusations.
-
 use ahash::AHashMap;
 
 use crate::{agg::SetRow, registry::ProviderId};
 
 #[derive(Default, Clone, Copy)]
 pub struct ProviderLive {
-    /// Sets this provider had any row in.
     pub present: u64,
-    /// Sets it delivered validly (decodable, nothing invalid or unverifiable).
     pub valid: u64,
-    /// Contested sets (>= 2 valid providers) it entered as a valid deliverer.
     pub races: u64,
-    /// Contested sets it decoded first (a tie counts as a win for each tied one).
+    /// A tie counts as a win for each tied provider.
     pub wins: u64,
-    /// Sum of microseconds behind the fastest, over the contested sets it entered.
     delta_sum_us: f64,
-    /// Number of contested-set deltas summed — the denominator for the mean.
     delta_n: u64,
+    delta_max_us: f64,
 }
 
 impl ProviderLive {
@@ -35,6 +20,15 @@ impl ProviderLive {
     }
     pub fn mean_behind_us(&self) -> Option<f64> {
         (self.delta_n > 0).then(|| self.delta_sum_us / self.delta_n as f64)
+    }
+    pub fn behind_sum_us(&self) -> f64 {
+        self.delta_sum_us
+    }
+    pub fn behind_n(&self) -> u64 {
+        self.delta_n
+    }
+    pub fn behind_max_us(&self) -> f64 {
+        self.delta_max_us
     }
     pub fn coverage(&self, total_sets: u64) -> Option<f64> {
         (total_sets > 0).then(|| self.present as f64 / total_sets as f64)
@@ -65,10 +59,8 @@ impl LiveStats {
         self.contested_sets
     }
 
-    /// Fold one harvest's rows in. Every provider's row for a given
-    /// `(slot, fec_set_index)` finalizes together — the harvest cutoff is
-    /// slot-based, not per-provider — so grouping within a single batch sees the
-    /// whole race and never scores half of it.
+    /// All providers' rows for a set finalize in the same harvest, so grouping
+    /// within one batch always sees the whole race.
     pub fn ingest(&mut self, rows: &[SetRow]) {
         let mut groups: AHashMap<(u64, u32), Vec<&SetRow>> = AHashMap::new();
         for r in rows {
@@ -81,49 +73,35 @@ impl LiveStats {
 
     fn fold_set(&mut self, set: &[&SetRow]) {
         self.total_sets += 1;
-
-        // Presence is over every row, valid or not — it is "did this provider show
-        // up for this set", the denominator of coverage.
         for r in set {
             self.per_provider.entry(r.provider).or_default().present += 1;
         }
 
-        // The fastest valid decode is the reference everyone is measured against.
-        let mut win_ns: Option<i64> = None;
-        let mut valid_count = 0u32;
-        for r in set {
-            if r.is_valid {
-                if let Some(d) = r.decode_ns {
-                    valid_count += 1;
-                    win_ns = Some(win_ns.map_or(d, |w| w.min(d)));
-                    self.per_provider.entry(r.provider).or_default().valid += 1;
-                }
-            }
+        let decoded: Vec<(ProviderId, i64)> = set
+            .iter()
+            .filter(|r| r.is_valid)
+            .filter_map(|r| Some((r.provider, r.decode_ns?)))
+            .collect();
+        for &(provider, _) in &decoded {
+            self.per_provider.entry(provider).or_default().valid += 1;
         }
 
-        // A race needs at least two valid deliverers. A set only one provider
-        // decoded is not a contest, so it moves no winrate and — crucially — no
-        // delta: counting a solo "win" at 0 µs behind would flatter whoever most
-        // often delivered alone.
-        let contested = valid_count >= 2;
-        if !contested {
+        // A solo delivery is not a race; scoring it would flatter lone deliverers.
+        if decoded.len() < 2 {
             return;
         }
         self.contested_sets += 1;
-        let win_ns = win_ns.expect("contested implies a valid decode");
-
-        for r in set {
-            if !r.is_valid {
-                continue;
-            }
-            let Some(d) = r.decode_ns else { continue };
-            let e = self.per_provider.entry(r.provider).or_default();
+        let win_ns = decoded.iter().map(|&(_, d)| d).min().unwrap();
+        for &(provider, d) in &decoded {
+            let e = self.per_provider.entry(provider).or_default();
             e.races += 1;
             if d == win_ns {
                 e.wins += 1;
             }
-            e.delta_sum_us += (d - win_ns) as f64 / 1000.0;
+            let behind_us = (d - win_ns) as f64 / 1000.0;
+            e.delta_sum_us += behind_us;
             e.delta_n += 1;
+            e.delta_max_us = e.delta_max_us.max(behind_us);
         }
     }
 }
@@ -132,7 +110,13 @@ impl LiveStats {
 mod tests {
     use super::*;
 
-    fn row(provider: ProviderId, slot: u64, fec: u32, decode_ns: Option<i64>, is_valid: bool) -> SetRow {
+    fn row(
+        provider: ProviderId,
+        slot: u64,
+        fec: u32,
+        decode_ns: Option<i64>,
+        is_valid: bool,
+    ) -> SetRow {
         SetRow {
             provider,
             slot,
@@ -159,7 +143,6 @@ mod tests {
     #[test]
     fn faster_provider_wins_and_slower_is_behind() {
         let mut s = LiveStats::new();
-        // One contested set: provider 0 decodes at 1.000 ms, provider 1 at 1.500 ms.
         s.ingest(&[
             row(0, 10, 0, Some(1_000_000), true),
             row(1, 10, 0, Some(1_500_000), true),
@@ -174,6 +157,8 @@ mod tests {
         assert_eq!(p1.winrate(), Some(0.0));
         assert_eq!(p0.mean_behind_us(), Some(0.0));
         assert_eq!(p1.mean_behind_us(), Some(500.0), "500_000 ns behind == 500 µs");
+        assert_eq!(p1.behind_max_us(), 500.0);
+        assert_eq!(p0.behind_max_us(), 0.0, "the winner is never behind itself");
         assert_eq!(p0.coverage(s.total_sets()), Some(1.0));
     }
 
@@ -191,12 +176,10 @@ mod tests {
     #[test]
     fn a_solo_set_is_not_a_race_and_does_not_dilute_the_mean() {
         let mut s = LiveStats::new();
-        // A contested set first, so provider 0 has one real race.
         s.ingest(&[
             row(0, 10, 0, Some(1_000_000), true),
             row(1, 10, 0, Some(1_500_000), true),
         ]);
-        // Then a set only provider 0 delivered validly.
         s.ingest(&[row(0, 11, 0, Some(2_000_000), true)]);
 
         let p0 = s.provider(0);
@@ -211,7 +194,7 @@ mod tests {
         let mut s = LiveStats::new();
         s.ingest(&[
             row(0, 10, 0, Some(1_000_000), true),
-            row(1, 10, 0, None, false), // present but did not deliver
+            row(1, 10, 0, None, false),
         ]);
         let p1 = s.provider(1);
         assert_eq!(p1.present, 1);

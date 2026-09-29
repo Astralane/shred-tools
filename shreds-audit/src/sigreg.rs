@@ -1,84 +1,184 @@
-//! Cross-source transaction correlation, keyed by transaction signature.
-//!
-//! A transaction's first signature (`signatures[0]`, 64 bytes) is the natural
-//! join key across paths. Per signature we keep one first-seen timestamp slot per
-//! source, and derive which source delivered first and by how much.
-//!
-//! Every timestamp is an absolute CLOCK_REALTIME nanosecond value on this one
-//! host, so a shred-vs-gRPC delta is an exact subtraction. One asymmetry: a shred
-//! arrival is stamped by the kernel at driver handoff, while a gRPC arrival is
-//! stamped in userspace only after decrypt+decode, so the gRPC side carries a
-//! little extra local processing latency — a property of where each path can be
-//! measured, not of the network. Called out in the report.
-//!
-//! Memory is bounded for a run of any length. In-flight signatures live in
-//! `events` only until their slot falls `EVICT_MARGIN_SLOTS` behind the highest
-//! slot seen; at that point the row is *finalized* — folded into per-source
-//! running counters and retired. The whole-run winrate/seen/contested counts and
-//! the mean are therefore exact, while the behind-distribution percentiles are
-//! taken over a bounded ring of the most recent samples. Nothing grows without
-//! limit, matching the O(providers) discipline of the FEC-set aggregator.
-
-use std::collections::VecDeque;
-
 use ahash::AHashMap;
+use hdrhistogram::Histogram;
 
 use crate::verification::onchain_signatures::{SlotSigIndex, SourceSlot};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SourceKind {
-    /// Transactions reconstructed from the shred (UDP) stream.
     Shred,
-    /// Transactions arriving over a Geyser gRPC subscription.
     Grpc,
+    GrpcDeshred,
 }
 
-/// Most recent behind-samples kept per source for percentile estimation. Older
-/// samples are dropped once this many accumulate; the mean and all counts stay
-/// exact over the whole run, only the percentiles are over this recent window.
-const BEHIND_SAMPLE_CAP: usize = 65_536;
+impl SourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shred => "shreds",
+            Self::Grpc => "grpc",
+            Self::GrpcDeshred => "grpc-deshred",
+        }
+    }
+}
 
-/// A signature is finalized (scored and retired) once its slot falls this many
-/// slots behind the highest slot observed on any source, so a slow source still
-/// lands before the row is retired. ~64 slots ≈ 25 s, well past the shred
-/// reconstruction settle window.
+impl serde::Serialize for SourceKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.label())
+    }
+}
+
+impl From<crate::config::GrpcMode> for SourceKind {
+    fn from(mode: crate::config::GrpcMode) -> Self {
+        match mode {
+            crate::config::GrpcMode::Transactions => Self::Grpc,
+            crate::config::GrpcMode::Deshred => Self::GrpcDeshred,
+        }
+    }
+}
+
+pub const VOTE_PROGRAM_ID: [u8; 32] = [
+    7, 97, 72, 29, 53, 116, 116, 187, 124, 77, 118, 36, 235, 211, 189, 179, 216, 53, 94, 115, 209,
+    16, 67, 252, 13, 163, 83, 128, 0, 0, 0, 0,
+];
+
+pub fn is_simple_vote(
+    signatures: usize,
+    legacy: bool,
+    instructions: usize,
+    program_id: Option<&[u8]>,
+) -> bool {
+    signatures < 3 && legacy && instructions == 1 && program_id == Some(&VOTE_PROGRAM_ID[..])
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TxnMeta {
+    pub server_created_at_ns: Option<i64>,
+    pub is_vote: Option<bool>,
+    pub message_size: Option<u32>,
+    pub connection_id: Option<u32>,
+}
+
+pub struct TxnRow {
+    pub sig: [u8; 64],
+    pub slot: u64,
+    pub sid: u16,
+    pub first_rx_unix_ns: i64,
+    pub duplicate_count: u32,
+    pub meta: TxnMeta,
+}
+
+/// Rows are retired this many slots behind the tip, so a slow source still lands first (~25 s).
 const EVICT_MARGIN_SLOTS: u64 = 64;
 
-/// Per-signature record held while the race is still in flight: the slot it
-/// belongs to and the first-seen unix-ns per source (indexed by source id).
+const WINDOW_RESERVOIR: usize = 50_000;
+
+#[derive(Clone, Copy)]
+struct Seen {
+    ns: i64,
+    dups: u32,
+    meta: TxnMeta,
+}
+
 struct SigRow {
     slot: u64,
-    ts: Vec<Option<i64>>,
+    ts: Vec<Option<Seen>>,
 }
 
 pub struct SigRegistry {
     names: Vec<String>,
     kinds: Vec<SourceKind>,
-    /// Signatures whose race is still in flight, retired on finalize.
     events: AHashMap<[u8; 64], SigRow>,
-    /// Highest slot seen on any source; drives the finalize floor.
     high_slot: u64,
-
-    // Whole-run running totals, folded in at finalize (exact).
     distinct_total: u64,
     contested_total: u64,
-    /// Distinct signatures observed per source.
     seen: Vec<u64>,
-    /// Contested signatures (seen by ≥2 sources) this source was present for.
     contested: Vec<u64>,
-    /// Contested signatures this source delivered first (ties all count).
     wins: Vec<u64>,
-    /// Exact mean numerator/denominator of ns-behind-earliest, per source.
     behind_sum_ns: Vec<i128>,
     behind_n: Vec<u64>,
-    /// Bounded ring of recent ns-behind samples per source, for percentiles.
-    behind_ring: Vec<VecDeque<i64>>,
-
-    /// Per-slot signature sets for the onchain audit. Inert until enabled, and
-    /// kept here so filing a delivery costs nothing beyond the lock the caller
-    /// already holds — the race and the audit see the same stream of records.
-    onchain: SlotSigIndex,
+    behind_histogram: Vec<Histogram<u64>>,
+    onchain: Option<SlotSigIndex>,
+    rows: Vec<TxnRow>,
+    collect_rows: bool,
+    rotating: Vec<bool>,
+    window_latency: AHashMap<(usize, u32), WindowLatency>,
+    finalized_floor: u64,
 }
+
+fn behind_histogram() -> Histogram<u64> {
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    hist.auto(true);
+    hist
+}
+
+pub struct WindowLatency {
+    pub contested: u64,
+    pub wins: u64,
+    pub behind_us: Histogram<u64>,
+    pub vs_shred_us: Reservoir,
+}
+
+impl WindowLatency {
+    fn new() -> Self {
+        Self {
+            contested: 0,
+            wins: 0,
+            behind_us: behind_histogram(),
+            vs_shred_us: Reservoir::new(WINDOW_RESERVOIR),
+        }
+    }
+}
+
+pub struct Reservoir {
+    cap: usize,
+    seen: u64,
+    values: Vec<i64>,
+    rng: u64,
+}
+
+impl Reservoir {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            seen: 0,
+            values: Vec::new(),
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    pub fn push(&mut self, v: i64) {
+        self.seen += 1;
+        if self.values.len() < self.cap {
+            self.values.push(v);
+            return;
+        }
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        let j = self.rng % self.seen;
+        if (j as usize) < self.cap {
+            self.values[j as usize] = v;
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.seen
+    }
+
+    pub fn percentiles(&mut self, qs: &[f64]) -> Vec<Option<f64>> {
+        if self.values.is_empty() {
+            return vec![None; qs.len()];
+        }
+        self.values.sort_unstable();
+        let n = self.values.len();
+        qs.iter()
+            .map(|q| {
+                let i = ((q * n as f64).ceil() as usize).clamp(1, n) - 1;
+                Some(self.values[i] as f64)
+            })
+            .collect()
+    }
+}
+
 
 impl SigRegistry {
     pub fn new(names: Vec<String>, kinds: Vec<SourceKind>) -> Self {
@@ -96,9 +196,34 @@ impl SigRegistry {
             wins: vec![0; n],
             behind_sum_ns: vec![0; n],
             behind_n: vec![0; n],
-            behind_ring: vec![VecDeque::new(); n],
-            onchain: SlotSigIndex::disabled(),
+            behind_histogram: (0..n).map(|_| behind_histogram()).collect(),
+            onchain: None,
+            rows: Vec::new(),
+            collect_rows: false,
+            rotating: vec![false; n],
+            window_latency: AHashMap::new(),
+            finalized_floor: 0,
         }
+    }
+
+    pub fn set_rotating(&mut self, sid: usize) {
+        self.rotating[sid] = true;
+    }
+
+    pub fn is_rotating(&self, sid: usize) -> bool {
+        self.rotating[sid]
+    }
+
+    pub fn high_slot(&self) -> u64 {
+        self.high_slot
+    }
+
+    pub fn finalized_floor(&self) -> u64 {
+        self.finalized_floor
+    }
+
+    pub fn take_window_latency(&mut self, sid: usize, connection_id: u32) -> Option<WindowLatency> {
+        self.window_latency.remove(&(sid, connection_id))
     }
 
     pub fn name(&self, sid: usize) -> &str {
@@ -109,160 +234,170 @@ impl SigRegistry {
         self.kinds[sid]
     }
 
-    /// Distinct signatures observed across all sources over the whole run.
     pub fn distinct_signatures(&self) -> u64 {
         self.distinct_total
     }
 
-    /// Contested signatures (seen by at least two sources) finalized so far.
     pub fn contested_signatures(&self) -> u64 {
         self.contested_total
     }
 
-    /// Record that `sid` first saw `sig` at `ns`. Only the earliest arrival per
-    /// (signature, source) is kept: a later re-delivery of the same signature on
-    /// the same source must not move the timestamp or it would erase the very
-    /// race we are trying to time.
-    pub fn record_first(&mut self, sid: usize, sig: [u8; 64], ns: i64, slot: u64) {
-        if slot > self.high_slot {
-            self.high_slot = slot;
+    pub fn record_first(&mut self, sid: usize, sig: [u8; 64], ns: i64, slot: u64, meta: TxnMeta) {
+        self.high_slot = self.high_slot.max(slot);
+        // Before the dedupe: the onchain audit must see re-deliveries the race ignores.
+        if let Some(index) = &mut self.onchain {
+            if !self.rotating[sid] {
+                index.record(sid, slot, &sig);
+            }
         }
-        // Before the dedupe below: the race deliberately ignores a re-delivery,
-        // but the audit has to see it — a transaction is in a block once, so a
-        // repeat is a discrepancy with that block.
-        self.onchain.record(sid, slot, &sig);
         let n = self.names.len();
-        if !self.events.contains_key(&sig) {
+        let row = self.events.entry(sig).or_insert_with(|| {
             self.distinct_total += 1;
-        }
-        let row = self.events.entry(sig).or_insert_with(|| SigRow {
-            slot,
-            ts: vec![None; n],
+            SigRow {
+                slot,
+                ts: vec![None; n],
+            }
         });
-        // Keep the first non-zero slot learned (a source may report 0 if unavailable).
-        if row.slot == 0 && slot != 0 {
+        // A source may report slot 0 when it does not know the slot.
+        if row.slot == 0 {
             row.slot = slot;
         }
-        if row.ts[sid].is_none() {
-            row.ts[sid] = Some(ns);
-            self.seen[sid] += 1;
+        match &mut row.ts[sid] {
+            Some(seen) => seen.dups += 1,
+            empty => {
+                *empty = Some(Seen { ns, dups: 0, meta });
+                self.seen[sid] += 1;
+            }
         }
     }
 
-    /// Start filing deliveries for the onchain audit, keeping `retain_slots`
-    /// worth of them. Until this is called the index is inert.
-    pub fn enable_onchain_index(&mut self, n_sources: usize, retain_slots: u64) {
-        self.onchain.enable(n_sources, retain_slots);
+    pub fn enable_txn_rows(&mut self) {
+        self.collect_rows = true;
     }
 
-    /// Highest slot the audit index has seen — the tip its sampling lags behind.
+    pub fn drain_rows(&mut self) -> Vec<TxnRow> {
+        std::mem::take(&mut self.rows)
+    }
+
+    pub fn enable_onchain_index(&mut self, retain_slots: u64) {
+        self.onchain = Some(SlotSigIndex::new(self.names.len(), retain_slots));
+    }
+
     pub fn onchain_tip(&self) -> u64 {
-        self.onchain.tip()
+        self.onchain.as_ref().map_or(0, |index| index.tip())
     }
 
-    /// Claim one slot's deliveries for auditing, removing them from the index.
     pub fn take_onchain_slot(&mut self, slot: u64) -> Option<Vec<SourceSlot>> {
-        self.onchain.take(slot)
+        self.onchain.as_mut()?.take(slot)
     }
 
-    /// Retire settled signatures into the running totals to keep `events` bounded.
-    /// With `force`, retire everything (used for the final snapshot); otherwise
-    /// only rows whose slot has fallen `EVICT_MARGIN_SLOTS` behind the tip.
+    /// Retire rows whose slot fell `EVICT_MARGIN_SLOTS` behind the tip (all rows with `force`).
     pub fn finalize(&mut self, force: bool) {
         let floor = self.high_slot.saturating_sub(EVICT_MARGIN_SLOTS);
+        self.finalized_floor = if force { u64::MAX } else { floor };
         let retire: Vec<[u8; 64]> = self
             .events
             .iter()
             .filter(|(_, row)| force || (row.slot != 0 && row.slot < floor))
-            .map(|(&k, _)| k)
+            .map(|(&sig, _)| sig)
             .collect();
-        for k in retire {
-            if let Some(row) = self.events.remove(&k) {
-                self.fold(&row);
+        for sig in retire {
+            let row = self.events.remove(&sig).unwrap();
+            if self.collect_rows {
+                self.emit_rows(&sig, &row);
             }
+            self.fold(&row);
         }
     }
 
-    /// Fold one retired signature into the per-source running totals.
+    fn emit_rows(&mut self, sig: &[u8; 64], row: &SigRow) {
+        for (sid, seen) in row.ts.iter().enumerate() {
+            let Some(seen) = seen else { continue };
+            self.rows.push(TxnRow {
+                sig: *sig,
+                slot: row.slot,
+                sid: sid as u16,
+                first_rx_unix_ns: seen.ns,
+                duplicate_count: seen.dups,
+                meta: seen.meta,
+            });
+        }
+    }
+
     fn fold(&mut self, row: &SigRow) {
-        let n = self.names.len();
-        let present: Vec<usize> = (0..n).filter(|&i| row.ts[i].is_some()).collect();
+        let present: Vec<(usize, Seen)> = row
+            .ts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, seen)| seen.map(|seen| (i, seen)))
+            .collect();
         if present.len() < 2 {
-            return; // a race needs at least two sources
+            return;
         }
         self.contested_total += 1;
-        let min = present.iter().map(|&i| row.ts[i].unwrap()).min().unwrap();
-        for &i in &present {
-            let ts = row.ts[i].unwrap();
+        let min = present.iter().map(|(_, seen)| seen.ns).min().unwrap();
+        let min_shred = present
+            .iter()
+            .filter(|(i, _)| self.kinds[*i] == SourceKind::Shred)
+            .map(|(_, seen)| seen.ns)
+            .min();
+        for (i, seen) in present {
+            let behind = seen.ns - min;
+            let behind_us = (behind / 1000) as u64;
+            let is_win = seen.ns == min;
             self.contested[i] += 1;
-            let behind = ts - min; // ns behind the earliest source (>= 0)
             self.behind_sum_ns[i] += behind as i128;
             self.behind_n[i] += 1;
-            let ring = &mut self.behind_ring[i];
-            if ring.len() == BEHIND_SAMPLE_CAP {
-                ring.pop_front();
+            let _ = self.behind_histogram[i].record(behind_us);
+            if is_win {
+                self.wins[i] += 1;
             }
-            ring.push_back(behind);
-            if ts == min {
-                self.wins[i] += 1; // all sources tied at the earliest ns win
+            if self.rotating[i] {
+                let conn = seen.meta.connection_id.unwrap_or(0);
+                let w = self
+                    .window_latency
+                    .entry((i, conn))
+                    .or_insert_with(WindowLatency::new);
+                w.contested += 1;
+                w.wins += is_win as u64;
+                let _ = w.behind_us.record(behind_us);
+                if let Some(shred) = min_shred {
+                    w.vs_shred_us.push((seen.ns - shred) / 1000);
+                }
             }
         }
     }
 
-    /// Per-source raw totals plus a clone of the recent behind-sample ring. The
-    /// clone lets the caller compute percentiles (a sort) *outside* the registry
-    /// lock, so the hot `record_first` path is never blocked on that work.
     pub fn export(&self) -> Vec<SourceRaw> {
         (0..self.names.len())
-            .map(|i| SourceRaw {
-                seen: self.seen[i],
-                contested: self.contested[i],
-                wins: self.wins[i],
-                mean_us: (self.behind_n[i] > 0).then(|| {
-                    self.behind_sum_ns[i] as f64 / self.behind_n[i] as f64 / 1000.0
-                }),
-                behind_ns: self.behind_ring[i].iter().copied().collect(),
+            .map(|i| {
+                let scored = self.behind_n[i] > 0;
+                let hist = &self.behind_histogram[i];
+                let quantile = |q| scored.then(|| hist.value_at_quantile(q) as f64);
+                SourceRaw {
+                    seen: self.seen[i],
+                    contested: self.contested[i],
+                    wins: self.wins[i],
+                    mean_us: scored
+                        .then(|| self.behind_sum_ns[i] as f64 / self.behind_n[i] as f64 / 1000.0),
+                    p50_us: quantile(0.5),
+                    p90_us: quantile(0.9),
+                    p99_us: quantile(0.99),
+                }
             })
             .collect()
     }
 }
 
-/// One source's whole-run totals for the snapshot. `behind_ns` is a copy of the
-/// recent behind-sample ring; run it through [`percentiles_us`] to summarise.
 #[derive(Clone, Debug, Default)]
 pub struct SourceRaw {
     pub seen: u64,
     pub contested: u64,
     pub wins: u64,
     pub mean_us: Option<f64>,
-    pub behind_ns: Vec<i64>,
-}
-
-/// p50 / p90 / p99 of a sample set, in microseconds. `None` when empty.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BehindPct {
-    pub p50: Option<f64>,
-    pub p90: Option<f64>,
-    pub p99: Option<f64>,
-}
-
-/// Nearest-rank percentiles of `samples_ns` (mutated in place: sorted). Kept out
-/// of the registry so the sort runs without the lock held.
-pub fn percentiles_us(samples_ns: &mut [i64]) -> BehindPct {
-    if samples_ns.is_empty() {
-        return BehindPct::default();
-    }
-    samples_ns.sort_unstable();
-    let n = samples_ns.len();
-    let pick = |p: f64| -> f64 {
-        let idx = ((n as f64 - 1.0) * p) as usize;
-        samples_ns[idx] as f64 / 1000.0
-    };
-    BehindPct {
-        p50: Some(pick(0.5)),
-        p90: Some(pick(0.9)),
-        p99: Some(pick(0.99)),
-    }
+    pub p50_us: Option<f64>,
+    pub p90_us: Option<f64>,
+    pub p99_us: Option<f64>,
 }
 
 #[cfg(test)]
@@ -283,11 +418,42 @@ mod tests {
     }
 
     #[test]
+    fn simple_vote_rule_holds_at_its_boundaries() {
+        let vote = Some(&VOTE_PROGRAM_ID[..]);
+        let other = [9u8; 32];
+        assert!(is_simple_vote(1, true, 1, vote));
+        assert!(is_simple_vote(2, true, 1, vote));
+        assert!(!is_simple_vote(3, true, 1, vote), "three signers is not a simple vote");
+        assert!(!is_simple_vote(1, false, 1, vote), "a versioned message is not a simple vote");
+        assert!(!is_simple_vote(1, true, 2, vote), "a second instruction disqualifies");
+        assert!(!is_simple_vote(1, true, 0, vote), "no instruction, nothing to vote with");
+        assert!(!is_simple_vote(1, true, 1, Some(&other[..])), "another program");
+        assert!(!is_simple_vote(1, true, 1, None), "no key to read means no claim");
+    }
+
+    #[test]
+    fn each_grpc_mode_maps_to_its_own_kind_and_label() {
+        use crate::config::GrpcMode;
+        assert_eq!(SourceKind::from(GrpcMode::Transactions), SourceKind::Grpc);
+        assert_eq!(
+            SourceKind::from(GrpcMode::Deshred),
+            SourceKind::GrpcDeshred
+        );
+        assert_eq!(SourceKind::Shred.label(), "shreds");
+        assert_eq!(SourceKind::Grpc.label(), "grpc");
+        assert_eq!(SourceKind::GrpcDeshred.label(), "grpc-deshred");
+        assert_ne!(
+            SourceKind::from(GrpcMode::Transactions).label(),
+            SourceKind::from(GrpcMode::Deshred).label()
+        );
+    }
+
+    #[test]
     fn first_seen_wins_and_dedupes() {
         let mut r = reg();
-        r.record_first(0, sig(1), 1_000, 42);
+        r.record_first(0, sig(1), 1_000, 42, TxnMeta::default());
         // a later re-delivery of the same signature on the same source is ignored
-        r.record_first(0, sig(1), 5_000, 42);
+        r.record_first(0, sig(1), 5_000, 42, TxnMeta::default());
         r.finalize(true);
         let raw = r.export();
         assert_eq!(raw[0].seen, 1);
@@ -299,41 +465,71 @@ mod tests {
     #[test]
     fn shred_ahead_of_grpc_wins_and_measures_behind() {
         let mut r = reg();
-        r.record_first(0, sig(1), 1_000, 42); // shred at t=1000
-        r.record_first(1, sig(1), 3_000, 42); // grpc  at t=3000
+        r.record_first(0, sig(1), 1_000, 42, TxnMeta::default());
+        r.record_first(1, sig(1), 3_000, 42, TxnMeta::default());
         r.finalize(true);
         let raw = r.export();
         assert_eq!(r.contested_signatures(), 1);
         assert_eq!(raw[0].wins, 1, "shred delivered first");
         assert_eq!(raw[1].wins, 0);
         // grpc is 2us behind the earliest (shred), shred is 0 behind
-        let mut b0 = raw[0].behind_ns.clone();
-        let mut b1 = raw[1].behind_ns.clone();
-        assert_eq!(percentiles_us(&mut b0).p50, Some(0.0));
-        assert_eq!(percentiles_us(&mut b1).p50, Some(2.0));
+        assert_eq!(raw[0].p50_us, Some(0.0));
+        assert_eq!(raw[1].p50_us, Some(2.0));
     }
 
     #[test]
     fn grpc_ahead_wins() {
         let mut r = reg();
-        r.record_first(1, sig(2), 2_000, 42); // grpc first
-        r.record_first(0, sig(2), 9_000, 42); // shred later
+        r.record_first(1, sig(2), 2_000, 42, TxnMeta::default());
+        r.record_first(0, sig(2), 9_000, 42, TxnMeta::default());
         r.finalize(true);
         let raw = r.export();
         assert_eq!(raw[1].wins, 1);
         assert_eq!(raw[0].wins, 0);
-        let mut b0 = raw[0].behind_ns.clone();
-        assert_eq!(percentiles_us(&mut b0).p50, Some(7.0)); // 9000-2000 = 7us
+        assert_eq!(raw[0].p50_us, Some(7.0));
+    }
+
+    #[test]
+    fn txn_rows_keep_lone_deliveries_duplicates_and_metadata() {
+        let mut r = reg();
+        r.enable_txn_rows();
+        let meta = TxnMeta {
+            server_created_at_ns: Some(900),
+            is_vote: Some(true),
+            message_size: Some(215),
+            connection_id: Some(3),
+        };
+        r.record_first(1, sig(1), 1_000, 42, meta);
+        r.record_first(1, sig(1), 9_000, 42, TxnMeta::default());
+        r.record_first(0, sig(2), 2_000, 42, TxnMeta::default());
+        r.finalize(true);
+
+        let rows = r.drain_rows();
+        assert_eq!(rows.len(), 2, "a lone delivery belongs in the table");
+        let grpc = rows.iter().find(|x| x.sid == 1).unwrap();
+        assert_eq!(grpc.first_rx_unix_ns, 1_000);
+        assert_eq!(grpc.duplicate_count, 1);
+        assert_eq!(grpc.meta, meta);
+        assert_eq!(grpc.slot, 42);
+        assert!(r.drain_rows().is_empty(), "rows are handed over, not copied");
+    }
+
+    #[test]
+    fn txn_rows_are_not_collected_unless_asked() {
+        let mut r = reg();
+        r.record_first(0, sig(1), 1_000, 42, TxnMeta::default());
+        r.finalize(true);
+        assert!(r.drain_rows().is_empty());
     }
 
     #[test]
     fn slot_floor_eviction_keeps_events_bounded() {
         let mut r = reg();
         // an old contested signature at slot 10
-        r.record_first(0, sig(1), 1_000, 10);
-        r.record_first(1, sig(1), 2_000, 10);
+        r.record_first(0, sig(1), 1_000, 10, TxnMeta::default());
+        r.record_first(1, sig(1), 2_000, 10, TxnMeta::default());
         // tip advances well past the eviction margin
-        r.record_first(0, sig(2), 3_000, 10 + EVICT_MARGIN_SLOTS + 5);
+        r.record_first(0, sig(2), 3_000, 10 + EVICT_MARGIN_SLOTS + 5, TxnMeta::default());
         r.finalize(false);
         // slot-10 row is finalized and retired; the fresh row stays in flight
         assert_eq!(r.contested_signatures(), 1);

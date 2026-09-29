@@ -1,0 +1,33 @@
+[package]
+name = "deshred"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+verify = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:solana-address", "dep:solana-signature", "dep:ureq"]
+
+[dependencies]
+bytes = "1.11.0"
+
+solana-ledger = { git = "https://github.com/nuel77/agave", branch = "feat/v4.3.0-shred-recover", features = ["agave-unstable-api"] }
+solana-entry = { git = "https://github.com/nuel77/agave", branch = "feat/v4.3.0-shred-recover", features = ["agave-unstable-api"] }
+solana-transaction = "4.2.0"
+solana-message = "4.5.0"
+wincode = "0.6.1"
+
+anyhow = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+solana-address = { version = "2", features = ["decode"], optional = true }
+solana-signature = { version = "3.1", features = ["verify"], optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+
+[dev-dependencies]
+solana-keypair = "3.1.2"
+solana-hash = "4.6.0"
+solana-signer = "3.0.1"
+
+[patch.crates-io]
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }

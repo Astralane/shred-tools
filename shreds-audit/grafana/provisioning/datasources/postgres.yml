@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: shred-audit
+    uid: shredaudit-pg
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: audit
+    database: shredaudit
+    isDefault: true
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    secureJsonData:
+      password: audit

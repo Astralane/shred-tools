@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+import "block_engine.proto";
+import "bundle.proto";
+import "shared.proto";
+
+package astralane_relayer;
+
+message ExpiringBundleBatch {
+  shared.Header header = 1;
+  repeated bundle.BundleUuid bundles = 2;
+  uint32 expiry_ms = 3;
+}
+
+message RelayUpdate {
+  oneof msg {
+    block_engine.ExpiringPacketBatch batches = 1;
+    shared.Heartbeat heartbeat = 2;
+    ExpiringBundleBatch bundles = 3;
+  }
+}
+
+service AstralaneRelayer {
+  rpc StartRelayStream (stream RelayUpdate)
+      returns (stream block_engine.StartExpiringPacketStreamResponse) {}
+}

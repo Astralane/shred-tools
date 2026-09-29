@@ -14,6 +14,14 @@ message Message {
   repeated CompiledInstruction instructions = 4;
   bool versioned = 5;
   repeated MessageAddressTableLookup address_table_lookups = 6;
+  optional TransactionConfig config = 7;
+}
+
+message TransactionConfig {
+  optional uint64 priority_fee = 1;
+  optional uint32 compute_unit_limit = 2;
+  optional uint32 loaded_accounts_data_size_limit = 3;
+  optional uint32 heap_size = 4;
 }
 
 message MessageHeader {

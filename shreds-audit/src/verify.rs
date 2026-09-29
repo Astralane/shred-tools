@@ -1,24 +1,6 @@
-//! Per-shred parse + signature verification.
-//!
-//! Every shred is verified. The cost is not what it first looks like:
-//!
-//! * `layout::get_merkle_root(shred)` recomputes the merkle root *from that
-//!   shred's own inclusion proof*. This is the per-shred half of the check and
-//!   it is pure hashing. If a shred was tampered with, or belongs to a
-//!   different set, its proof will not hash to the signed root.
-//! * The ed25519 signature covers that root. Every shred in a FEC set carries
-//!   the *same* `(signature, root)` pair, so the elliptic-curve work is once
-//!   per set, not once per shred. We dedupe identical `(sig, root, leader)`
-//!   triples inside each chunk before touching the curve.
-//!
-//! Net effect at 6 providers x ~11 kpps: ~400 k merkle-root recomputations per
-//! second (cheap) and ~6 k ed25519 verifies per second (the expensive part),
-//! rather than 400 k ed25519 verifies. Every shred still gets its own verdict.
-//!
-//! Batch verification is kept for the case where a chunk really does contain
-//! many distinct sets, but a batch that fails is re-checked individually so a
-//! single bad signature cannot condemn its neighbours. Invalid shreds are
-//! expected in this data, not exceptional.
+//! Per-shred parse and signature verification. Each shred's merkle root is
+//! recomputed from its own proof; the ed25519 check runs once per distinct
+//! `(sig, root)` in a chunk, since every shred of a FEC set shares both.
 
 use ahash::AHashMap;
 use ed25519_dalek::{Signature as DalekSig, VerifyingKey};
@@ -39,15 +21,11 @@ const CODING_NUM_CODING_OFFSET: usize = 85;
 const CODING_POSITION_OFFSET: usize = 87;
 const DATA_FLAGS_OFFSET: usize = 85;
 const CODING_HEADER_LEN: usize = 89;
-const KIND_MASK: u8 = 0xC0;
-const KIND_CODE: u8 = 0x40;
-const KIND_DATA: u8 = 0x80;
 const LAST_IN_SLOT_FLAGS: u8 = 0b1100_0000;
-/// Set on the final data shred of a FEC set.
 const DATA_COMPLETE_FLAG: u8 = 0b0100_0000;
 
-/// One verified shred. `sig_ok == None` means we had no leader for the slot and
-/// therefore could not form an opinion — distinct from `Some(false)`.
+type Triple = ([u8; 64], [u8; 32], Pubkey);
+
 pub struct VerifiedShred {
     pub provider: ProviderId,
     pub rx_unix_ns: i64,
@@ -57,22 +35,18 @@ pub struct VerifiedShred {
     pub is_code: bool,
     pub position: u32,
     pub last_in_slot: bool,
-    /// This data shred closes its FEC set (DATA_COMPLETE). With it, `position + 1`
-    /// is the set's data-shred count even when no coding shred was delivered.
+    /// Last data shred of its FEC set, so `position + 1` is the set's data-shred count.
     pub data_complete: bool,
     pub num_data: Option<u16>,
     pub num_coding: Option<u16>,
     pub leader: Option<Pubkey>,
+    /// `None` when the slot's leader is unknown: no verdict, not a failure.
     pub sig_ok: Option<bool>,
     pub merkle_ok: bool,
-    /// FNV-1a of the full payload, for duplicate detection inside a FEC set.
+    /// FNV-1a of the full payload, for duplicate detection.
     pub payload_hash: u64,
-    /// SHA-256 of the shred's *block data* — headers plus payload, and nothing
-    /// else. See `data_range`. `None` for variants we cannot locate it in.
-    ///
-    /// This is what makes "the signature is wrong" separable from "the data is
-    /// wrong". Two copies of a shred with the same `data_hash` carry identical
-    /// block content, whatever their merkle proofs say about it.
+    /// SHA-256 of the block data only (see `data_range`), so a broken proof can be
+    /// told apart from altered content.
     pub data_hash: Option<[u8; 32]>,
 }
 
@@ -80,8 +54,6 @@ pub struct VerifiedShred {
 pub struct VerifyStats {
     pub parsed: u64,
     pub malformed: u64,
-    /// Well-formed datagrams carrying a shred variant this build cannot parse
-    /// (legacy, or newer than us). Counted and dropped — never counted invalid.
     pub unsupported_variant: u64,
     pub non_shred_ping: u64,
     pub wrong_version: u64,
@@ -92,25 +64,16 @@ pub struct VerifyStats {
     pub batch_fallbacks: u64,
 }
 
-/// Parsed shred awaiting a signature verdict.
-struct Pending {
-    shred: VerifiedShred,
-    /// Index into the dedup table, or `None` when no verdict is possible.
-    key: Option<usize>,
-}
-
-
 pub fn verify_chunk(
     packets: Vec<Packet>,
     schedule: &LeaderSchedule,
     shred_version: Option<u16>,
     stats: &mut VerifyStats,
 ) -> Vec<VerifiedShred> {
-    // ---- pass 1: parse, recompute each shred's own merkle root ----
-    let mut pending: Vec<Pending> = Vec::with_capacity(packets.len());
-    // (signature, root) -> index into `triples`
+    // Each shred with the index of its (sig, root) triple, if a verdict is possible.
+    let mut pending: Vec<(VerifiedShred, Option<usize>)> = Vec::with_capacity(packets.len());
     let mut dedup: AHashMap<([u8; 64], [u8; 32]), usize> = AHashMap::new();
-    let mut triples: Vec<([u8; 64], [u8; 32], Pubkey)> = Vec::new();
+    let mut triples: Vec<Triple> = Vec::new();
 
     for p in packets {
         let s: &[u8] = &p.data;
@@ -118,26 +81,16 @@ pub fn verify_chunk(
             stats.malformed += 1;
             continue;
         }
-        // A ping is not a shred and not a defect: the provider is faithfully
-        // relaying a valid protocol message that shares the socket. Counting it
-        // as malformed would read, in an archive handed to that provider, as an
-        // accusation that they sent us garbage.
+        // A relayed ping is a valid protocol message, not a provider defect.
         if is_ping(s) {
             stats.non_shred_ping += 1;
             continue;
         }
-        if let Some(want) = shred_version {
-            let v = u16::from_le_bytes([s[VERSION_OFFSET], s[VERSION_OFFSET + 1]]);
-            if v != want {
-                stats.wrong_version += 1;
-                continue;
-            }
+        if shred_version.is_some_and(|want| read_u16(s, VERSION_OFFSET) != want) {
+            stats.wrong_version += 1;
+            continue;
         }
-        // A variant this build does not understand is NOT an invalid shred: we
-        // can't reconstruct its merkle root, so it would fail the check and count
-        // against the provider. On the day Solana ships a new variant, every
-        // provider would light up at ~100% invalid and look like mass tampering.
-        // "I don't know what this is" gets its own counter, never a verdict.
+        // An unknown variant can't have its merkle root rebuilt; it must not count as invalid.
         let Some((is_code, _, _, _)) = decode_variant(s[VARIANT_OFFSET]) else {
             stats.unsupported_variant += 1;
             continue;
@@ -151,8 +104,6 @@ pub fn verify_chunk(
             continue;
         };
 
-        // Resolve the leader first: a slot nowhere near the schedule we hold is
-        // not a shred at all, and must not be attributed to a FEC set.
         let leader = match schedule.classify(slot) {
             SlotVerdict::Implausible => {
                 stats.malformed += 1;
@@ -166,56 +117,36 @@ pub fn verify_chunk(
         };
         stats.parsed += 1;
 
-        let (num_data, num_coding) = if is_code {
+        let (num_data, num_coding, position) = if is_code {
             (
-                Some(u16::from_le_bytes([s[CODING_NUM_DATA_OFFSET], s[CODING_NUM_DATA_OFFSET + 1]])),
-                Some(u16::from_le_bytes([
-                    s[CODING_NUM_CODING_OFFSET],
-                    s[CODING_NUM_CODING_OFFSET + 1],
-                ])),
+                Some(read_u16(s, CODING_NUM_DATA_OFFSET)),
+                Some(read_u16(s, CODING_NUM_CODING_OFFSET)),
+                read_u16(s, CODING_POSITION_OFFSET) as u32,
             )
         } else {
-            (None, None)
+            (None, None, shred_index.saturating_sub(fec_set_index))
         };
-        let position = if is_code {
-            u16::from_le_bytes([s[CODING_POSITION_OFFSET], s[CODING_POSITION_OFFSET + 1]]) as u32
-        } else {
-            shred_index.saturating_sub(fec_set_index)
-        };
-        let last_in_slot =
-            !is_code && (s[DATA_FLAGS_OFFSET] & LAST_IN_SLOT_FLAGS) == LAST_IN_SLOT_FLAGS;
-        // The last data shred of a FEC set carries DATA_COMPLETE. It is the only
-        // way to learn a set's data-shred count without a coding shred, and some
-        // providers forward data shreds only — without this their sets would never
-        // be marked decodable and they would look like they delivered nothing.
-        let data_complete = !is_code && (s[DATA_FLAGS_OFFSET] & DATA_COMPLETE_FLAG) != 0;
+        let flags = s[DATA_FLAGS_OFFSET];
+        let last_in_slot = !is_code && flags & LAST_IN_SLOT_FLAGS == LAST_IN_SLOT_FLAGS;
+        let data_complete = !is_code && flags & DATA_COMPLETE_FLAG != 0;
 
-        // This is the per-shred integrity check: recompute the root from this
-        // shred's merkle proof. A shred that does not belong to the signed set
-        // fails here, before the signature is ever consulted.
         let root = layout::get_merkle_root(s);
         let merkle_ok = root.is_some();
         if !merkle_ok {
             stats.no_merkle_root += 1;
         }
 
-        let mut sig = [0u8; 64];
-        sig.copy_from_slice(&s[..64]);
+        let sig: [u8; 64] = s[..64].try_into().unwrap();
+        let key = root.zip(leader).map(|(root, leader)| {
+            let root = root.to_bytes();
+            *dedup.entry((sig, root)).or_insert_with(|| {
+                triples.push((sig, root, leader));
+                triples.len() - 1
+            })
+        });
 
-        let key = match (root, leader) {
-            (Some(root), Some(leader)) => {
-                let root_bytes: [u8; 32] = root.to_bytes();
-                let idx = *dedup.entry((sig, root_bytes)).or_insert_with(|| {
-                    triples.push((sig, root_bytes, leader));
-                    triples.len() - 1
-                });
-                Some(idx)
-            }
-            _ => None,
-        };
-
-        pending.push(Pending {
-            shred: VerifiedShred {
+        pending.push((
+            VerifiedShred {
                 provider: p.provider,
                 rx_unix_ns: p.rx_unix_ns,
                 slot,
@@ -234,36 +165,30 @@ pub fn verify_chunk(
                 data_hash: data_range(s).map(|r| solana_sdk::hash::hash(&s[r]).to_bytes()),
             },
             key,
-        });
+        ));
     }
 
-    // ---- pass 2: verify the unique (sig, root, leader) triples ----
     let verdicts = verify_triples(&triples, stats);
 
-    // ---- pass 3: attribute verdicts back to every shred ----
-    let mut out = Vec::with_capacity(pending.len());
-    for mut p in pending {
-        p.shred.sig_ok = p.key.map(|i| verdicts[i]);
-
-        if p.shred.sig_ok == Some(false) {
-            stats.sig_bad += 1;
-        }
-        out.push(p.shred);
-    }
-    out
+    pending
+        .into_iter()
+        .map(|(mut shred, key)| {
+            shred.sig_ok = key.map(|i| verdicts[i]);
+            if shred.sig_ok == Some(false) {
+                stats.sig_bad += 1;
+            }
+            shred
+        })
+        .collect()
 }
 
-fn verify_triples(triples: &[([u8; 64], [u8; 32], Pubkey)], stats: &mut VerifyStats) -> Vec<bool> {
-    if triples.is_empty() {
-        return Vec::new();
-    }
+fn verify_triples(triples: &[Triple], stats: &mut VerifyStats) -> Vec<bool> {
     stats.ed25519_verifies += triples.len() as u64;
 
-    // Below this size the batch machinery (a random scalar per signature, plus a
-    // multiscalar mul) costs more than just verifying them one by one.
+    // Below this, batch setup costs more than verifying one by one.
     const BATCH_MIN: usize = 8;
     if triples.len() < BATCH_MIN {
-        return triples.iter().map(|t| verify_one(t)).collect();
+        return triples.iter().map(verify_one).collect();
     }
 
     let mut msgs: Vec<&[u8]> = Vec::with_capacity(triples.len());
@@ -271,8 +196,7 @@ fn verify_triples(triples: &[([u8; 64], [u8; 32], Pubkey)], stats: &mut VerifySt
     let mut keys: Vec<VerifyingKey> = Vec::with_capacity(triples.len());
     for (sig, root, leader) in triples {
         let Ok(vk) = VerifyingKey::from_bytes(&leader.to_bytes()) else {
-            // A leader pubkey that is not a valid curve point can never verify.
-            return triples.iter().map(|t| verify_one(t)).collect();
+            return triples.iter().map(verify_one).collect();
         };
         msgs.push(root.as_slice());
         sigs.push(DalekSig::from_bytes(sig));
@@ -282,57 +206,21 @@ fn verify_triples(triples: &[([u8; 64], [u8; 32], Pubkey)], stats: &mut VerifySt
     if ed25519_dalek::verify_batch(&msgs, &sigs, &keys).is_ok() {
         return vec![true; triples.len()];
     }
-    // At least one is bad; batch verification cannot say which, so fall back.
-    // Invalid shreds are routine here, so this path is hot.
+    // A failed batch can't say which signature is bad; invalid shreds are routine, so this is hot.
     stats.batch_fallbacks += 1;
     triples.par_iter().map(verify_one).collect()
 }
 
-fn verify_one((sig, root, leader): &([u8; 64], [u8; 32], Pubkey)) -> bool {
-    let Ok(vk) = VerifyingKey::from_bytes(&leader.to_bytes()) else {
-        return false;
-    };
-    vk.verify_strict(root.as_slice(), &DalekSig::from_bytes(sig))
-        .is_ok()
+fn verify_one((sig, root, leader): &Triple) -> bool {
+    VerifyingKey::from_bytes(&leader.to_bytes())
+        .is_ok_and(|vk| vk.verify_strict(root, &DalekSig::from_bytes(sig)).is_ok())
 }
 
+fn read_u16(s: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([s[off], s[off + 1]])
+}
 
-/// The shred's **block data**: the headers plus the payload, and nothing else.
-/// This is the hinge of the invalid-sig / invalid-data split, so it is worth
-/// being exact about where it stops.
-///
-/// A merkle shred lays out as:
-///
-/// ```text
-///   [0..64)      leader signature       (over the merkle root)
-///   [64..D)      headers + block data   <-- this range
-///   [D..D+32)    chained merkle root    ] signed, but NOT block data:
-///   [D+32..P)    merkle inclusion proof ] authentication material
-///   [P..end)     retransmitter signature   (leader does not sign this at all)
-/// ```
-///
-/// with `D = SIZE_OF_PAYLOAD - 32*chained - 20*proof_size - 64*resigned`, from
-/// agave's `ShredVariant` byte:
-///
-/// ```text
-///   0x40|ps  code, plain        0x80|ps  data, plain
-///   0x60|ps  code, chained      0x90|ps  data, chained
-///   0x70|ps  code, chained+resigned
-///                               0xb0|ps  data, chained+resigned
-/// ```
-///
-/// Note this is deliberately **not** agave's merkle leaf, which runs to `D+32`
-/// and so swallows the chained root. The chained root is signed, but it is a link
-/// to the previous FEC set, not block content — a relay that wrecks it has broken
-/// authentication, not altered a transaction, and the two must not be conflated.
-///
-/// Everything from `D` on is authentication material. A relay can wreck all of it
-/// (and one of ours does) while relaying the leader's real data untouched;
-/// hashing `[64..D)` and nothing else is what tells that apart from substitution.
-/// Legacy shreds have no merkle layout and yield `None`.
-/// Decode agave's `ShredVariant` byte into `(is_code, proof_size, chained, resigned)`.
-/// `None` for legacy shreds (`0x5a`/`0xa5`) and for anything this build has never
-/// heard of — both of which must be counted, never judged.
+/// `(is_code, proof_size, chained, resigned)` from agave's `ShredVariant` byte.
 fn decode_variant(variant: u8) -> Option<(bool, usize, bool, bool)> {
     let proof_size = (variant & 0x0f) as usize;
     let (is_code, chained, resigned) = match variant & 0xf0 {
@@ -347,6 +235,17 @@ fn decode_variant(variant: u8) -> Option<(bool, usize, bool, bool)> {
     Some((is_code, proof_size, chained, resigned))
 }
 
+pub fn is_shred_payload(payload: &[u8]) -> bool {
+    payload
+        .get(VARIANT_OFFSET)
+        .is_some_and(|&v| decode_variant(v).is_some())
+}
+
+/// The shred's block data: `[64..D)`, after the leader signature and before the
+/// authentication tail (chained root, merkle proof, retransmitter signature),
+/// where `D = SIZE_OF_PAYLOAD - 32*chained - 20*proof_size - 64*resigned`.
+/// Deliberately not agave's merkle leaf, which also covers the chained root: a
+/// relay that wrecks the tail has broken authentication, not altered block data.
 fn data_range(s: &[u8]) -> Option<std::ops::Range<usize>> {
     const SIZE_OF_DATA_PAYLOAD: usize = 1203;
     const SIZE_OF_CODE_PAYLOAD: usize = 1228;
@@ -366,31 +265,10 @@ fn data_range(s: &[u8]) -> Option<std::ops::Range<usize>> {
     Some(SIZE_OF_SIGNATURE..proof_offset)
 }
 
-/// A Solana ping, as bincode lays it out:
-///
-/// ```text
-/// [0..4]    u32 = 4    enum discriminant
-/// [4..36]   Pubkey     sender identity
-/// [36..68]  [u8; 32]   random token
-/// [68..132] Signature  ed25519 over the token
-/// ```
-///
-/// Validators ping peers over the same UDP socket that carries shreds — it is
-/// the liveness handshake a node does before it will serve repair — so a
-/// provider forwarding that socket's contents relays them to us too.
-///
-/// They must be recognised *before* the shred parse, not after. The kind of a
-/// shred is read from the top two bits of byte 64, which in a ping lands inside
-/// the random token: about half of all pings have those bits set to `DATA` or
-/// `CODE` by chance and would otherwise parse as a shred whose "slot" is really
-/// the tail of that token — a phantom FEC set at a nonsense slot.
-///
-/// The signature is verified before we call it a ping. A counter in an archive
-/// is a claim about a provider, and "relayed a valid Solana ping" is a very
-/// different claim from "sent a malformed packet"; anything that fails this
-/// check stays malformed. No real shred is 132 bytes, so this can never swallow
-/// one, and the ed25519 cost is paid only by packets that are already the exact
-/// length and discriminant of a ping.
+/// A Solana ping (`u32 = 4`, pubkey, 32-byte token, signature over the token).
+/// Checked before the shred parse: byte 64 lands in the random token, so about half
+/// of pings would otherwise parse as shreds at nonsense slots. The signature must
+/// verify, so only a genuine ping is excused from `malformed`.
 fn is_ping(s: &[u8]) -> bool {
     const PING_LEN: usize = 132;
     const PING_DISCRIMINANT: u32 = 4;
@@ -398,16 +276,12 @@ fn is_ping(s: &[u8]) -> bool {
     if s.len() != PING_LEN || u32::from_le_bytes([s[0], s[1], s[2], s[3]]) != PING_DISCRIMINANT {
         return false;
     }
-    let from: [u8; 32] = s[4..36].try_into().expect("length checked");
-    let sig: [u8; 64] = s[68..132].try_into().expect("length checked");
-    let Ok(vk) = VerifyingKey::from_bytes(&from) else {
-        return false;
-    };
-    vk.verify_strict(&s[36..68], &DalekSig::from_bytes(&sig))
-        .is_ok()
+    let from: [u8; 32] = s[4..36].try_into().unwrap();
+    let sig: [u8; 64] = s[68..132].try_into().unwrap();
+    VerifyingKey::from_bytes(&from)
+        .is_ok_and(|vk| vk.verify_strict(&s[36..68], &DalekSig::from_bytes(&sig)).is_ok())
 }
 
-#[inline]
 fn fnv1a(s: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in s {

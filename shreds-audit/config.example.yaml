@@ -3,8 +3,18 @@
 # This is all you need to get started. Every other setting has a sensible
 # default — see the "Optional" section at the bottom only if you want to tune.
 
-# Mainnet RPC, used only to fetch the leader schedule (not on the hot path).
+# Mainnet RPC for the leader schedule (not on the hot path), and the default
+# endpoint for the getBlock audits below. A bare URL:
 rpc_url: "https://api.mainnet-beta.solana.com"
+# ...or a hosted provider. Switching provider is changing `provider` only — the
+# API key goes where that provider expects it (query, path or header) and is
+# never logged or stored. Set `rpc` OR `rpc_url`, not both.
+#   provider: generic | shyft | helius | triton
+#   url:      optional for shyft/helius (their mainnet URL is the default)
+#   token:    the API key; `env:NAME` reads it from the environment
+# rpc:
+#   provider: shyft
+#   token: env:SHYFT_API_KEY
 
 # UDP ports shred-audit listens on. Give each provider one port and tell them
 # to send there.
@@ -26,6 +36,35 @@ providers:
 # rotate_secs: 600          # new archive every N secs (0 = one archive at exit)
 # shred_version: null       # drop shreds not matching this version (null = all)
 #
+# Where captured data goes. Omitted means zip — the default this tool has always
+# had. `--export <mode>` on the command line overrides this.
+#
+#   zip       rotating Parquet archives in output_dir (and live.zip under --live)
+#   postgres  periodic aggregates into PostgreSQL, for a monitor that runs forever
+#             with Grafana in front of it. Writes no files at all.
+#   off       keep nothing; the TUI still works.
+#
+# --dump-shreds, --dump-txns and --live only exist in zip mode; asking for them in
+# another mode is refused at startup rather than silently ignored.
+#
+# export:
+#   mode: postgres
+#   postgres:
+#     # libpq connection string — user, password and database all ride in here.
+#     # Leave empty to take it from $DATABASE_URL instead (how docker-compose
+#     # passes credentials without putting them in this file).
+#     # Add ?connect_timeout=5 when the database is remote: it bounds how long a
+#     # shutdown can wait on an unreachable host.
+#     url: "postgres://audit:audit@127.0.0.1:5432/shredaudit"
+#     # Seconds per aggregation interval: the dashboard's resolution and the write
+#     # rate at once. One row per provider and one per counter each interval.
+#     flush_secs: 15
+#
+# The three tables are created on connect (CREATE TABLE IF NOT EXISTS), so an
+# empty database is enough. Note there are NO migrations — see src/out/schema.sql.
+# TLS is not supported yet: a connection string with sslmode=require is refused
+# with an explicit message rather than a confusing connection failure.
+#
 # Match a provider by source IP instead of / in addition to port:
 # providers:
 #   - name: gamma
@@ -43,6 +82,33 @@ providers:
 #     url: "https://deshred.example.com:443"
 #     x_token: "optional-auth-token"
 #     mode: deshred           # pre-execution; commitment is not supported
+#   - name: deshred-baseline
+#     url: "https://deshred.example.com:443"
+#     mode: deshred
+#     rotate: false           # opt out of filter rotation: one unfiltered stream
+#
+# Filter rotation (ON by default for every grpc source). Each source cycles
+# through filter bundles, one bundle per 30-60 s window on a fresh subscription.
+# Every delivery is checked against its own filter tags, and every Nth slot is
+# compared filter-by-filter with the confirmed block (a full getBlock, shared by
+# all sources). With `export.mode: postgres` everything lands in the
+# filter_windows / filter_slot_checks / filter_violations / rpc_block_fetches
+# tables, which the "filter audit" Grafana dashboard and alert rules read.
+#
+# Rotating sources are left out of the unfiltered onchain audit below (they
+# deliver a filtered subset by design); their latency is recorded per window.
+#
+# filter_rotation:
+#   enabled: true
+#   min_secs: 30
+#   max_secs: 60
+#   sample_every_slots: 10    # one full getBlock per sampled slot (~every 4 s)
+#   bundles:                  # omit to use the built-in set (all fields, ALT
+#     - name: my_bundle       # lookups, overlapping filters, a never-matching one)
+#       filters:
+#         jup: { vote: false, account_include: ["JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"] }
+#         no_votes: { vote: false }
+#         # also: account_exclude, account_required, failed (transactions mode only)
 #
 # Onchain audit of the transaction comparison above. Every few seconds it samples
 # one recent slot, fetches that block's signatures with getBlock, and counts what
@@ -55,5 +121,6 @@ providers:
 #
 # onchain_verify: true
 # onchain_sample_secs: 5    # seconds between sampled slots (one getBlock each)
-# onchain_rpc_url: "http://your-node:8899"   # defaults to rpc_url
+# onchain_rpc_url: "http://your-node:8899"   # defaults to rpc / rpc_url
+# onchain_rpc: { provider: shyft, token: env:SHYFT_API_KEY }   # or with a provider
 # onchain_lag_slots: 32     # how far behind the tip to sample (~13s); minimum 8

@@ -3,8 +3,8 @@
 
 # Capture archives. These hold per-provider arrival timestamps — the competitive
 # latency data the whole tool exists to produce. Never commit them.
-out/
-out-*/
+/out/
+/out-*/
 
 # Local provider setup (ports, source IPs, RPC endpoint, gRPC tokens). Copy
 # config.example.yaml to config.yaml and edit; only the example is tracked.

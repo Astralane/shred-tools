@@ -1,0 +1,430 @@
+apiVersion: 1
+groups:
+- orgId: 1
+  name: filter-audit
+  folder: shred-audit
+  interval: 1m
+  rules:
+  - uid: fa-filter-false-positive
+    title: Filter false positive (server filter bug)
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, filter, SUM(extra_in_block)::float AS value
+          FROM filter_slot_checks WHERE ts > now() - interval '15 minutes'
+          GROUP BY host, source, filter
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} delivered transactions its filter `{{ $labels.filter }}` rejects'
+      description: '{{ $values.A }} transactions in 15m were delivered with the filter''s tag, are in
+        the confirmed block, and fail the filter. See filter_violations (violation = ''extra_in_block'')
+        for signatures and the failing clause.'
+    labels:
+      severity: page
+      component: filter-audit
+    isPaused: false
+  - uid: fa-tag-errors
+    title: Filter tag errors (self-check)
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, bundle, SUM(tag_false_positive + tag_missing)::float AS value
+          FROM filter_windows WHERE ended_at > now() - interval '15 minutes'
+          GROUP BY host, source, bundle
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} mis-tags updates in bundle `{{ $labels.bundle }}`'
+      description: '{{ $values.A }} deliveries in 15m carried a tag the filter rejects, or lacked a tag
+        the filter accepts. Checked on every delivery. See filter_violations (tag_false_positive / tag_missing).'
+    labels:
+      severity: page
+      component: filter-audit
+    isPaused: false
+  - uid: fa-missed-rate
+    title: Filter missed rate above 0.5%
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, filter, SUM(missed)::float / SUM(expected) AS value
+          FROM filter_slot_checks WHERE ts > now() - interval '30 minutes' AND block_status = 'ok'
+          GROUP BY host, source, filter HAVING SUM(expected) >= 200
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0.005
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} misses {{ humanizePercentage $values.A.Value }} of `{{ $labels.filter
+        }}` matches'
+      description: Over 30m of sampled slots, confirmed-block transactions accepted by the filter were
+        not delivered with its tag. See filter_violations (violation = 'missed').
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false
+  - uid: fa-phantoms
+    title: Deliveries not in the confirmed block above 2%
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, SUM(extra_not_in_block)::float / SUM(delivered) AS value
+          FROM filter_slot_checks WHERE ts > now() - interval '30 minutes'
+          GROUP BY host, source HAVING SUM(delivered) >= 200
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0.02
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }}: {{ humanizePercentage $values.A.Value }} of deliveries are not in
+        the confirmed block'
+      description: Pre-execution feeds carry some fork transactions; this rate is well above that. Check
+        for a stuck fork, stale replays, or fabricated transactions (filter_violations, violation = 'extra_not_in_block').
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false
+  - uid: fa-rotation-stalled
+    title: Filter rotation stalled
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, EXTRACT(EPOCH FROM now() - MAX(ended_at))::float AS value
+          FROM filter_windows WHERE ended_at > now() - interval '1 day'
+          GROUP BY host, source
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 300
+    noDataState: Alerting
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: No filter window from {{ $labels.source }} in {{ $values.A }}s
+      description: Windows last 30-60s, so a rotating source writes one per minute. None for 5 minutes
+        (or no rows at all) means the collector is down, stuck, or cannot reach the database.
+    labels:
+      severity: page
+      component: filter-audit
+    isPaused: false
+  - uid: fa-window-errors
+    title: gRPC windows failing
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, COUNT(*)::float AS value
+          FROM filter_windows WHERE ended_at > now() - interval '15 minutes' AND end_reason LIKE 'error%'
+          GROUP BY host, source
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 3
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }}: {{ $values.A }} windows ended in an error in 15m'
+      description: Connect or stream errors instead of clean rotations. filter_windows.end_reason has
+        the message.
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false
+  - uid: fa-no-ground-truth
+    title: Filter audit has no ground truth (getBlock failing)
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, COUNT(*) FILTER (WHERE status IN ('ok', 'skipped'))::float AS value
+          FROM rpc_block_fetches WHERE ts > now() - interval '10 minutes'
+          GROUP BY host
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: lt
+            params:
+            - 1
+    noDataState: Alerting
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: No successful getBlock in 10 minutes on {{ $labels.host }}
+      description: Without blocks nothing is being checked against the chain. rpc_block_fetches.error
+        has the reason (rate limit, auth, provider outage).
+    labels:
+      severity: page
+      component: filter-audit
+    isPaused: false
+  - uid: fa-vote-flag
+    title: Server is_vote disagrees with the simple-vote rule
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, SUM(vote_flag_mismatch)::float AS value
+          FROM filter_windows WHERE ended_at > now() - interval '30 minutes'
+          GROUP BY host, source
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} flags votes differently from agave''s rule'
+      description: The `vote` filter depends on this flag. filter_violations (violation = 'vote_flag_mismatch')
+        shows the transactions.
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false
+  - uid: fa-tagging-protocol
+    title: Updates without tags or with unknown tags
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, SUM(untagged_updates + unknown_tags)::float AS value
+          FROM filter_windows WHERE ended_at > now() - interval '30 minutes'
+          GROUP BY host, source
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 0
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} sends updates whose `filters` list is empty or names unknown filters'
+      description: Multi-filter bundles rely on the per-update filter names; without them tag correctness
+        cannot be checked.
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false
+  - uid: fa-latency-vs-shreds
+    title: Feed slower than shred providers (p50 > 50 ms)
+    condition: C
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 3600
+        to: 0
+      datasourceUid: shredaudit-pg
+      model:
+        refId: A
+        rawQuery: true
+        editorMode: code
+        format: table
+        rawSql: |-
+          SELECT host, source, AVG(vs_shred_p50_us)::float / 1000 AS value
+          FROM filter_windows WHERE ended_at > now() - interval '30 minutes' AND vs_shred_n >= 100
+          GROUP BY host, source
+        intervalMs: 60000
+        maxDataPoints: 43200
+    - refId: C
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            type: gt
+            params:
+            - 50
+    noDataState: OK
+    execErrState: Error
+    for: 0s
+    annotations:
+      summary: '{{ $labels.source }} p50 is {{ $values.A }} ms behind the fastest shred provider'
+      description: Placeholder threshold — set it from a week of normal traffic. Per-window percentiles
+        averaged over 30m.
+    labels:
+      severity: warn
+      component: filter-audit
+    isPaused: false

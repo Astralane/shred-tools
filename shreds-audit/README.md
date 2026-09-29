@@ -11,6 +11,102 @@ report you can open in any Parquet tool to compare providers side by side.
 Everything is measured from **one machine's clock**, so comparing two providers
 is an exact subtraction — no baseline provider, no clock skew to correct for.
 
+<details>
+<summary><b>⚠️ Never built a Rust project? Start here — clean machine to a finished report, about ten minutes.</b></summary>
+
+Nothing below assumes you have used Rust before. Copy each block in order. The
+one prerequisite is a Linux machine your providers send shreds to (or can start
+sending to).
+
+**1. Install Rust**
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+The second line puts `cargo` on the `PATH` of this shell; shells you open later
+pick it up on their own.
+
+**2. Get the code and build it**
+
+```sh
+git clone https://github.com/Astralane/shred-tools.git
+cd shred-tools/shreds-audit
+cargo build --release
+```
+
+The first build takes 5–15 minutes — it compiles the Solana crates from source.
+It is finished when you see a line starting with `Finished`. Warnings scrolling
+past are normal; only a line starting with `error:` means it failed.
+
+**3. Write the config**
+
+```sh
+cp config.example.yaml config.yaml
+```
+
+Open `config.yaml` in any editor. Two things need to match your setup:
+
+- `listen_ports` — the UDP ports you receive on, one per provider.
+- `providers` — one entry per provider: a name you choose, and the port that
+  provider sends to.
+
+For two providers on ports 20001 and 20002 that is the whole file — everything
+else in the example is optional and already has a working default:
+
+```yaml
+rpc_url: "https://api.mainnet-beta.solana.com"
+listen_ports: [20001, 20002]
+providers:
+  - name: alpha
+    port: 20001
+  - name: beta
+    port: 20002
+```
+
+Then give each provider this machine's public IP and the port that belongs to
+them, and allow those UDP ports in your firewall or security group.
+
+**4. Let the kernel keep the packets**
+
+```sh
+sudo sysctl -w net.core.rmem_max=67108864
+```
+
+Once per machine. Skip it and the kernel quietly drops packets under load — the
+report flags this, but a flagged run is one you have to repeat. Details in
+[One-time host tuning](#one-time-host-tuning-please-do-this).
+
+**5. Run it for two minutes**
+
+```sh
+./target/release/shred-audit --config config.yaml --duration-secs 120
+```
+
+A dashboard comes up and the tool stops on its own after 120 seconds. Two
+minutes is enough data to compare providers; a longer `--duration-secs` narrows
+the numbers further.
+
+Glance at the dashboard in the first few seconds — every provider should be
+showing packets. One sitting at zero isn't reaching you: check its port and the
+firewall rather than waiting out the run.
+
+**6. Send the file**
+
+The run leaves one archive in `out/`:
+
+```sh
+ls out/*.zip
+```
+
+Send that `shred-audit-<timestamp>-<hostname>.zip` to the Astralane team — it is
+the whole result. Inside are the timing tables and a `manifest.json` describing
+the run: hostname, provider names and IPs, and the `rpc_url` you configured. No
+auth tokens, and your `config.yaml` is not included.
+
+</details>
+
 ## What you get, per provider
 
 - **winrate** — how often it delivered a usable set *first*.
@@ -27,15 +123,10 @@ with a slow trickle and still lose the race that matters.
 
 ## Install
 
-You need a recent [Rust toolchain](https://rustup.rs/). Nothing else — the build
-brings its own `protoc`.
-
-```sh
-cargo build --release        # produces target/release/shred-audit
-```
-
-The first build is slow (it compiles a large Solana dependency); later builds are
-quick. You can also just run `make release`.
+A recent [Rust toolchain](https://rustup.rs/) and nothing else — the build brings
+its own `protoc`. `cargo build --release` (or `make release`) puts the binary at
+`target/release/shred-audit`. The first build compiles a large Solana dependency
+and is slow; later ones are quick.
 
 ## Run
 
@@ -43,8 +134,8 @@ quick. You can also just run `make release`.
 ./target/release/shred-audit --config config.yaml
 ```
 
-It opens a live dashboard comparing your providers, and writes a report archive
-on exit (Ctrl-C), on a timer, and whenever it rotates.
+A live dashboard comparing your providers. A report archive is written on exit —
+Ctrl-C, or `--duration-secs` running out — and on every rotation.
 
 ### One-time host tuning (please do this)
 
@@ -69,6 +160,7 @@ results.**
 | `--duration-secs <n>` | stop after `n` seconds (`0` = run until Ctrl-C) |
 | `--no-tui` | turn off the live dashboard, print a status line instead |
 | `--dump-shreds` | also record every individual shred — **very large**, off by default |
+| `--dump-txns` | also record every transaction arrival per source — **very large**, off by default |
 | `--live` | keep refreshing `out/live.zip` for an external live viewer to poll |
 
 ## Configure
@@ -132,6 +224,14 @@ execution, so it has no commitment or transaction-status metadata. Do not set
 `commitment` on a `deshred` source. Both modes are matched to locally
 reconstructed transactions by `transaction.signatures[0]`.
 
+The two modes stay distinguishable everywhere they are reported. In the manifest
+and the dashboard each source carries a `kind` — `shreds` for the local shred
+reconstruction, `grpc` for a post-execution subscription, `grpc-deshred` for a
+pre-execution one — and the ping rows use the same vocabulary, so a deshred
+endpoint is never reported as a plain gRPC one. Keep `kind` in view when reading
+winrates: a pre-execution feed is timed before execution and a post-execution
+subscription after it, so the two are not racing on equal terms.
+
 #### Is any of it real? — the onchain audit
 
 Winning a race proves a source was *fast*, not that it was *right*. A feed that
@@ -176,6 +276,83 @@ reports transactions that may never land, and a `processed` subscription can
 deliver from a fork that lost. Read it next to `onchain_missed` before calling it
 fabrication. Set `onchain_verify: false` to turn the whole thing off.
 
+Sources that rotate filters (next section) deliver a filtered subset of every
+block by design, so they are left out of this audit and judged by the filter
+audit instead.
+
+#### Do the filters work? — filter rotation
+
+Every gRPC source rotates through **filter bundles** by default: one bundle per
+window of 30–60 s (random), each on a fresh subscription, cycling through every
+bundle in shuffled order. A bundle is several named filters in one request —
+exactly what a client sends — so the server also has to tag each update with
+the names of every filter it matched. The built-in bundles cover every filter
+field (`vote`, `account_include`, `account_exclude`, `account_required`, and
+`failed` on post-execution feeds), include through **lookup-table** addresses
+(USDC / wSOL mints), overlapping filters, filters combined with AND, an
+unfiltered `all`, and a `never` filter on a key nobody uses, which must stay
+silent.
+
+Each window is checked two ways:
+
+| check | coverage | what it catches |
+|---|---|---|
+| **tags** — each filter re-evaluated on the delivered transaction vs the update's `filters` list | every delivery | `tag_false_positive` (tagged, filter rejects it), `tag_missing` (filter accepts it, no tag), `vote_flag_mismatch` (server `is_vote` vs agave's simple-vote rule) |
+| **chain** — every slot with `slot % sample_every_slots == 0` (default 10) that the window fully covered, vs the confirmed block from a full `getBlock` | sampled slots | `missed` (block txs the filter accepts, not delivered with its tag), `extra_in_block` (delivered with the tag, filter rejects it), `extra_not_in_block` (not in the confirmed block: forks, stale, fabricated) |
+
+A slot counts only if the subscription was live for all of it (a couple of slots
+after subscribing, and before the last slot the window delivered), so switching
+filters never reads as a miss. One `getBlock` per sampled slot is shared by all
+sources — about one call every 4 s.
+
+`missed`, `extra_in_block` and the tag errors should be zero; the violation
+table keeps up to 25 example signatures per window, filter and kind, each with
+the clause that matched or failed (including whether a key came from a lookup
+table). Latency is also recorded per window: the race against every other
+source, the signed difference to the fastest **shred** provider for the same
+transaction, and receive time minus the server's `created_at`.
+
+Point the audit at a provider with a key rather than a public node — switching
+provider is one field:
+
+```yaml
+rpc:
+  provider: shyft          # generic | shyft | helius | triton
+  token: env:SHYFT_API_KEY # key read from the environment; never logged or stored
+```
+
+Set `rotate: false` on a source to keep one unfiltered subscription for the whole
+run (a stable latency baseline next to the rotating ones), or
+`filter_rotation.enabled: false` to turn rotation off everywhere.
+
+#### Running it forever: Postgres + Grafana
+
+```sh
+docker compose up -d                                  # postgres + grafana on 127.0.0.1
+SHYFT_API_KEY=... cargo run --release -- --config config.yaml --export postgres --no-tui
+```
+
+Grafana (http://127.0.0.1:3000) is provisioned with two dashboards — `shred-audit`
+(providers, race) and **`shred-audit — filter audit`** (correctness per filter,
+violations, windows, getBlock health, latency per window and bundle) — and with
+the alert rules in `grafana/provisioning/alerting/filter-audit.yml`:
+
+| alert | severity | fires when |
+|---|---|---|
+| Filter false positive | page | any `extra_in_block` in 15 m |
+| Filter tag errors | page | any tag false positive / missing tag in 15 m |
+| No ground truth | page | no successful `getBlock` in 10 m |
+| Rotation stalled | page | no window from a source in 5 m (or none at all) |
+| Missed rate | warn | > 0.5 % of a filter's matches missed over 30 m |
+| Not in confirmed block | warn | > 2 % of a source's deliveries over 30 m |
+| Windows failing | warn | > 3 windows ended in an error in 15 m |
+| Vote flag / tagging protocol | warn | server `is_vote` or `filters` lists disagree |
+| Slower than shreds | warn | p50 vs fastest shred provider > 50 ms (placeholder) |
+
+No contact point is provisioned — add yours in Grafana (Alerting → Contact
+points). The tables are documented in `src/filters/schema.sql`; all rows are
+per-window or per-slot deltas, so `SUM` them over a range.
+
 ## The report
 
 Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:
@@ -187,6 +364,8 @@ Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:
   delivery counts, and validity. This is the table you compare providers on.
 - **`shreds.parquet`** — one row per shred, only present if you passed
   `--dump-shreds`.
+- **`transactions.parquet`** — one row per (transaction, source), only present if
+  you passed `--dump-txns`. See below.
 
 Load the Parquet files into whatever you like — DuckDB, pandas, Polars, a
 spreadsheet importer — and compare. The columns that matter most:
@@ -218,6 +397,70 @@ reports are evidence you might hand back to a provider:
 
 Genuine Solana network pings that ride the same socket are recognised and
 excluded — they are never counted against a provider.
+
+### `transactions.parquet` — every arrival, not just the summary
+
+The manifest's `txn_compare` block says *who won, on average*. This table is the
+raw material behind it: one row per **(transaction, source)** — when that source
+first had that transaction on this machine, and whatever the source itself said
+about it.
+
+Pass `--dump-txns` to write it. It needs the transaction comparison configured
+(`grpc_sources`), and it is as large as `--dump-shreds`:
+every source repeats every transaction the cluster produces, votes included.
+
+| column | meaning |
+|---|---|
+| `signature` | base58 `signatures[0]` — the join key across sources |
+| `slot` | the slot this source attributed it to |
+| `source` | source name from your config |
+| `source_mode` | `shreds`, `grpc`, or `grpc-deshred` — the same vocabulary as the manifest |
+| `first_rx_unix_ns` | when it first arrived **here**; this is the number the race is decided on |
+| `server_created_at_ns` | when the sending server says it produced the message |
+| `duplicate_count` | times this source sent it *again* after the first (0 = clean) |
+| `is_vote` | a consensus vote rather than user traffic |
+| `message_size` | size of the transaction in that source's own encoding |
+| `connection_id` | which connection of that source delivered it, counting from 0 |
+
+A null in the last four columns means **this kind of feed does not carry that
+value** — never zero, and never "we lost it":
+
+| | `server_created_at_ns` | `is_vote` | `message_size` | `connection_id` |
+|---|---|---|---|---|
+| `shreds` | — | yes | — | — |
+| `grpc` | yes | yes | yes | yes |
+| `grpc-deshred` | yes | yes | yes | yes |
+
+The shred path has no server to timestamp anything, no connection to number, and
+its transactions were rebuilt locally rather than received as messages.
+
+Four things to know before you read it:
+
+- **`server_created_at_ns` is another machine's clock.** Everything else in this
+  tool is one host's `CLOCK_REALTIME`, which is why provider deltas are exact
+  subtractions. Subtract this column from `first_rx_unix_ns` and you get network
+  delay *plus that server's clock offset*, which nothing here measures. It is the
+  source's claim about when it had the transaction, not a measured latency.
+- **`is_vote` means the same thing on every row.** The gRPC feeds report it; the
+  shred path derives it, using agave's simple-vote shape (one
+  instruction into the vote program, fewer than three signatures). Votes are
+  roughly half of mainnet traffic (~53 %), so `WHERE is_vote = false` is usually
+  the first thing you write.
+- **`message_size` is per-encoding.** Protobuf on the gRPC feeds. Compare it
+  over time within one source, not between two.
+- **A row appears when its race settles**, ~64 slots (≈25 s) behind the tip. The
+  tail of a capture window therefore lands in the *next* archive, and a source
+  re-delivering a transaction after that starts a fresh row at
+  `duplicate_count = 0`.
+
+```sql
+-- median gap between what a feed claims and when it actually landed, votes out
+SELECT source, source_mode,
+       median(first_rx_unix_ns - server_created_at_ns) / 1000 AS us_behind_claim
+FROM 'transactions.parquet'
+WHERE is_vote = false AND server_created_at_ns IS NOT NULL
+GROUP BY 1, 2;
+```
 
 ---
 

@@ -1,0 +1,1055 @@
+{
+  "uid": "shred-audit",
+  "title": "shred-audit",
+  "description": "Per-provider shred delivery. provider_stats and audit_counters hold per-interval DELTAS, so panels aggregate over the selected range rather than reading a running total. Top row is absolute and works with a single provider; the row below it is relative and needs two.",
+  "tags": [
+    "shred-audit",
+    "solana"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "collector restarts",
+        "enable": true,
+        "iconColor": "orange",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shredaudit-pg"
+        },
+        "target": {
+          "refId": "Anno",
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT started_at AS time,\n       'collector ' || tool_version || ' @ ' || git_commit AS text,\n       'restart' AS tags\nFROM audit_runs\nWHERE host = '$host' AND $__timeFilter(started_at)"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "capture host",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shredaudit-pg"
+        },
+        "query": "SELECT DISTINCT host FROM provider_stats ORDER BY 1",
+        "definition": "SELECT DISTINCT host FROM provider_stats ORDER BY 1",
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Clean set rate — every shred in the set verified",
+      "description": "A set counts as clean only when EVERY shred in it verified, none lacked a known leader, and enough arrived to reconstruct it (agg.rs: `invalid == 0 && unverifiable == 0 && decode_ns.is_some()`). Missed shreds do NOT count against it — Reed-Solomon rebuilds a set from any k of k+m.\n\nIt is an all-or-nothing gate over ~60 shreds, so it AMPLIFIES a small per-shred failure rate: at 1% per shred barely half the sets come out clean. Never read this as 'half the data is garbage'. Read the per-shred panel beside it first — that is the honest rate, and this one is its 60th power.\n\nNo threshold line: we have no baseline yet. Set one once a week of normal traffic says what normal is.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       sets_valid::float / NULLIF(sets_present, 0) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Per-shred failure rates — the honest number",
+      "description": "What the previous panel is made of, without the ~60x per-set amplification.\n\n'invalid' is shreds that failed verification, over shreds delivered. 'no leader' is shreds we could not check at all because the slot's leader was unknown — if that is non-zero the invalid rate is understated and the leader schedule is the thing to fix. 'missed' is over shreds EXPECTED (delivered + missed), so it is comparable between providers regardless of how much traffic each carried.\n\nProviders that delivered nothing are excluded on purpose: a silent feed would otherwise draw a flat 0% and read as the cleanest one on the board.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "insertNulls": 45000,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider || ' · invalid' AS metric,\n       invalid::float / (shreds_data + shreds_code) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND shreds_data + shreds_code > 0\nUNION ALL\nSELECT ts AS time,\n       provider || ' · no leader' AS metric,\n       sig_unverifiable::float / (shreds_data + shreds_code) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND shreds_data + shreds_code > 0\nUNION ALL\nSELECT ts AS time,\n       provider || ' · missed' AS metric,\n       missed::float / (missed + shreds_data + shreds_code) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND shreds_data + shreds_code > 0\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Set fill time — how long THIS provider took",
+      "description": "From a provider's first accepted shred of a set to the one that made the set decodable. The only ABSOLUTE latency here: winrate and 'behind fastest' are relative, so a change that slows every provider equally moves neither of them and moves this one. Needs no second provider. 'worst' is the slowest single set in the interval — an intermittent stall barely shifts the mean and spikes there.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "µs",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider || ' · mean' AS metric,\n       fill_sum_us / NULLIF(fill_n, 0) AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nUNION ALL\nSELECT ts AS time,\n       provider || ' · worst' AS metric,\n       fill_max_us AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Winrate — share of contested FEC sets decoded first",
+      "description": "A set is contested only when two or more providers delivered it validly; delivering alone is not a win. Ties count as a win for each. Empty with a single provider — see the panel's no-data text.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "noValue": "no contested sets in this range — a race needs TWO providers delivering the same FEC set validly. With one provider this is empty by definition, not broken. The absolute panels above still work."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       wins::float / races * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND races > 0\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 99,
+      "type": "timeseries",
+      "title": "Winner share per source",
+      "description": "Share of first-delivery (unique) shreds by source. Sums to 100%.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       wins::float / NULLIF(sum(wins) over(partition by ts), 0) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Behind the fastest provider",
+      "description": "Microseconds behind whoever decoded each contested set first. Mean is SUM(behind_sum_us)/SUM(behind_n) — the table stores the sum unreduced so any range divides exactly, instead of averaging pre-averaged intervals. Run the old and new forwarder side by side as two providers and this panel is the migration verdict.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "µs",
+          "min": 0,
+          "noValue": "no contested sets in this range — a race needs TWO providers delivering the same FEC set validly. With one provider this is empty by definition, not broken. The absolute panels above still work."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider || ' · mean' AS metric,\n       behind_sum_us / behind_n AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND behind_n > 0\nUNION ALL\nSELECT ts AS time,\n       provider || ' · worst' AS metric,\n       behind_max_us AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND behind_n > 0\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Coverage — sets this provider turned up for",
+      "description": "sets_present / sets_total, where the denominator is every distinct set ANY provider delivered this interval. Presence only, valid or not. With a single provider it is 100% by construction — read it next to the usable set rate at the top, never on its own.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       sets_present::float / NULLIF(sets_total, 0) * 100 AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "FEC sets per second",
+      "description": "Delivery rate per provider, divided by the row's own window_secs so a short first interval or a stalled loop does not distort it.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 22,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       sets_present / NULLIF(window_secs, 0) AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Missed shreds per second",
+      "description": "Shreds a provider never delivered for sets it was part of. Check host health below FIRST: datagrams the kernel dropped from our own socket are absent from the data and inflate this for whoever sent them.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 22,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider AS metric,\n       missed / NULLIF(window_secs, 0) AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Failed verification, and repeats",
+      "description": "'bad data' is block content the leader never signed — treat as substitution until proven otherwise. 'bad proof' is the leader's genuine data whose merkle proof does not reconstruct the signed root: authentic content, unusable shred. 'unclassified' means no provider delivered a leader-authenticated copy to compare against, so it could not be split — with ONE provider everything lands here and the other two read zero. 'repeats' is the same shred delivered twice.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time, provider || ' · bad data' AS metric, invalid_data AS value FROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nUNION ALL\nSELECT ts AS time, provider || ' · bad proof' AS metric, invalid_sig AS value FROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nUNION ALL\nSELECT ts AS time, provider || ' · unclassified' AS metric, invalid_unknown AS value FROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nUNION ALL\nSELECT ts AS time, provider || ' · repeats' AS metric, duplicated AS value FROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Stream integrity — is the wire format still what we expect",
+      "description": "Per second. shreds_after_window is the REORDERING canary: shreds arriving for FEC sets already finalized, which is what a forwarder that buffers or reorders produces. malformed / no_merkle_root mean packets are being mangled; wrong_version means a different cluster or shred version is being relayed; unsupported_variant means something arrived this build cannot parse. All four are zero on a healthy feed.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       name AS metric,\n       value::float / NULLIF(window_secs, 0) AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('shreds_after_window', 'shreds_malformed', 'shreds_wrong_version',\n               'shreds_unsupported_variant', 'shreds_no_merkle_root', 'shreds_no_leader')\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Data vs coding shreds per second",
+      "description": "A forwarder that stops relaying CODING shreds looks alive on every other counter — sets keep arriving, they just stop being recoverable from partial delivery. Nothing else here separates the two, so watch the ratio, not the absolute level.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider || ' · data' AS metric,\n       shreds_data / NULLIF(window_secs, 0) AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nUNION ALL\nSELECT ts AS time,\n       provider || ' · coding' AS metric,\n       shreds_code / NULLIF(window_secs, 0) AS value\nFROM provider_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Host health — OUR losses, not a provider's",
+      "description": "Every series here is this machine failing to keep up, not a provider failing to send. udp_kernel_dropped is our socket queue overflowing (raise net.core.rmem_max); udp_channel_full is verification falling behind. Both make the missed-shreds panel look worse than the network was. Non-zero here invalidates a comparison.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       name AS metric,\n       value::float / NULLIF(window_secs, 0) AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('udp_kernel_dropped', 'udp_channel_full', 'udp_truncated',\n               'udp_no_timestamp', 'udp_unmatched')\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Throughput",
+      "description": "Datagrams received, shreds parsed out of them, and shreds that failed signature verification — per second.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       name AS metric,\n       value::float / NULLIF(window_secs, 0) AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('udp_received', 'shreds_parsed', 'shreds_sig_bad')\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Provider RTT (ICMP)",
+      "description": "A GAUGE, re-sampled by the pinger on its own timer — consecutive points can repeat one measurement. A coarse network-distance hint, NOT comparable to the decode deltas: ICMP travels a different path and is routinely deprioritised. Use it to EXPLAIN a latency difference, never to measure one. Null = no reply.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ms",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT ts AS time,\n       provider || ' ' || ip AS metric,\n       rtt_ms AS value\nFROM provider_pings\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Transaction deliveries per second — when a feed went quiet",
+      "description": "txn_source_stats is cumulative, so consecutive rows are differenced here to get a rate. A restart resets the counters, which would read as a large negative rate; those points are dropped so the line breaks instead of diving. The table below says a feed fell behind — this says when.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "insertNulls": 45000
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT time,\n       metric,\n       CASE WHEN d >= 0 THEN d / NULLIF(dt, 0) END AS value\nFROM (\n  SELECT ts     AS time,\n         source AS metric,\n         seen - LAG(seen) OVER (PARTITION BY source ORDER BY ts) AS d,\n         EXTRACT(epoch FROM ts - LAG(ts) OVER (PARTITION BY source ORDER BY ts)) AS dt\n  FROM txn_source_stats\n  WHERE $__timeFilter(ts) AND host = '$host'\n) s\nORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Transaction sources — CUMULATIVE for the run",
+      "description": "The one cumulative table: percentiles come from a histogram spanning the whole process, so this is the latest row per source, not an interval, and it resets when the collector restarts. Do not SUM these columns. onchain bad % is a SAMPLED audit against getBlock — compare sources on the percentage, never on raw counts, and remember pre-execution feeds legitimately carry transactions that never landed. missed / corrupted / duplicated are its three components and are NOT interchangeable: never delivering a transaction is a different accusation from delivering it altered, and only the raw counts tell them apart.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT DISTINCT ON (source)\n       source,\n       kind,\n       seen,\n       contested,\n       winrate * 100        AS \"win %\",\n       behind_p50_us       AS \"p50 µs\",\n       behind_p90_us       AS \"p90 µs\",\n       behind_p99_us       AS \"p99 µs\",\n       onchain_missed      AS \"missed\",\n       onchain_corrupted   AS \"corrupted\",\n       onchain_duplicated  AS \"duplicated\",\n       onchain_bad_pct * 100 AS \"onchain bad %\"\nFROM txn_source_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY source, ts DESC"
+        }
+      ]
+    }
+  ]
+}

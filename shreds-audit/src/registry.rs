@@ -4,16 +4,9 @@ use ahash::AHashMap;
 
 use crate::config::Config;
 
-/// Provider index. Small and `Copy` so it rides the hot path for free.
 pub type ProviderId = u16;
 
-/// Resolves `(src_ip, dst_port)` to a provider, most-specific rule first:
-///
-///   1. `(ip, port)` — provider declared both
-///   2. `port`       — provider declared only a port
-///   3. `ip`         — provider declared only IPs
-///
-/// A packet that matches nothing is counted, not silently dropped.
+/// Resolves `(src_ip, dst_port)` to a provider: `(ip, port)`, then `port`, then `ip`.
 pub struct Registry {
     names: Vec<String>,
     by_ip_port: AHashMap<(Ipv4Addr, u16), ProviderId>,
@@ -32,17 +25,14 @@ impl Registry {
             let id = idx as ProviderId;
             names.push(p.name.clone());
             match (p.port, p.ips.is_empty()) {
-                // both -> most specific
                 (Some(port), false) => {
                     for ip in &p.ips {
                         by_ip_port.insert((*ip, port), id);
                     }
                 }
-                // port only
                 (Some(port), true) => {
                     by_port.insert(port, id);
                 }
-                // ips only
                 (None, false) => {
                     for ip in &p.ips {
                         by_ip.insert(*ip, id);
@@ -62,13 +52,11 @@ impl Registry {
 
     #[inline]
     pub fn resolve(&self, src_ip: Ipv4Addr, dst_port: u16) -> Option<ProviderId> {
-        if let Some(id) = self.by_ip_port.get(&(src_ip, dst_port)) {
-            return Some(*id);
-        }
-        if let Some(id) = self.by_port.get(&dst_port) {
-            return Some(*id);
-        }
-        self.by_ip.get(&src_ip).copied()
+        self.by_ip_port
+            .get(&(src_ip, dst_port))
+            .or_else(|| self.by_port.get(&dst_port))
+            .or_else(|| self.by_ip.get(&src_ip))
+            .copied()
     }
 
     pub fn name(&self, id: ProviderId) -> &str {
@@ -91,11 +79,15 @@ mod tests {
 
     fn cfg(providers: Vec<ProviderCfg>) -> Config {
         Config {
-            rpc_url: "http://x".into(),
+            rpc_url: Some("http://x".into()),
+            rpc: None,
+            onchain_rpc: None,
+            filter_rotation: Default::default(),
             listen_ports: vec![1, 2, 3],
             bind_ip: Ipv4Addr::UNSPECIFIED,
             providers,
             output_dir: "./out".into(),
+            export: Default::default(),
             rotate_secs: 600,
             verify_threads: 1,
             fec_max_wait_slots: 10,
@@ -103,7 +95,6 @@ mod tests {
             live_secs: 10,
             ping_secs: 30,
             grpc_sources: vec![],
-            txn_settle_secs: 1,
             onchain_verify: true,
             onchain_sample_secs: 5,
             onchain_rpc_url: None,
@@ -119,13 +110,9 @@ mod tests {
             ProviderCfg { name: "port".into(), port: Some(1), ips: vec![] },
             ProviderCfg { name: "ip".into(), port: None, ips: vec![a] },
         ]));
-        // exact (ip, port) wins
         assert_eq!(r.name(r.resolve(a, 1).unwrap()), "both");
-        // port-only rule catches a different source IP on the same port
         assert_eq!(r.name(r.resolve("10.0.0.9".parse().unwrap(), 1).unwrap()), "port");
-        // ip-only rule catches the same IP on a different port
         assert_eq!(r.name(r.resolve(a, 2).unwrap()), "ip");
-        // nothing matches
         assert!(r.resolve("10.0.0.9".parse().unwrap(), 2).is_none());
     }
 
