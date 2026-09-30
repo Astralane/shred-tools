@@ -1,25 +1,23 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    ops::RangeInclusive,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use solana_entry::entry::{Entry, MaxDataShredsLen};
-use solana_ledger::shred::{ReedSolomonCache, Shred, Shredder, recover};
+use solana_ledger::shred::{Error as ShredError, ReedSolomonCache, Shred, Shredder, recover};
 use solana_transaction::versioned::VersionedTransaction;
 use wincode::{Deserialize, containers::Vec as WincodeVec};
 
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const SIZE_OF_COMMON_SHRED_HEADER: usize = 83;
-const MAX_SLOTS_AHEAD: u64 = 64;
-const RESYNC_AFTER_REJECTED: u32 = 1_024;
-const WARMUP_SHREDS: usize = 64;
+const SLOT_HISTORY_SIZE: u64 = 256;
 
 #[derive(Debug, Clone)]
 pub struct CompletedDataSet {
     pub slot: u64,
-    pub start: u32,
-    pub end: u32,
+    pub start_shred_index: u32,
+    pub end_shred_index: u32,
     pub entries: Vec<Entry>,
 }
 
@@ -31,320 +29,361 @@ impl CompletedDataSet {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct RecoveryStats {
-    pub elapsed: Duration,
-    pub recovered: usize,
-}
-
-#[derive(Debug, Default)]
-pub struct ShredInsertionResult {
-    pub data_sets: Vec<CompletedDataSet>,
-    pub recovery: Option<RecoveryStats>,
-    pub decode_errors: usize,
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeshredStats {
+    pub recoveries: u64,
+    pub recovered_shreds: u64,
+    pub recovery_time: Duration,
+    pub decode_errors: u64,
 }
 
 pub struct Deshredder {
-    max_wait_slots: u64,
-    rs_cache: ReedSolomonCache,
-    slots: HashMap<u64, SlotState>,
-    max_slot: Option<u64>,
-    warmup: Vec<u64>,
-    rejected_in_a_row: u32,
+    reed_solomon_cache: ReedSolomonCache,
+    slots: Box<[Option<SlotState>]>,
+    stats: DeshredStats,
+}
+
+impl Default for Deshredder {
+    fn default() -> Self {
+        Self {
+            reed_solomon_cache: ReedSolomonCache::default(),
+            slots: (0..SLOT_HISTORY_SIZE).map(|_| None).collect(),
+            stats: DeshredStats::default(),
+        }
+    }
 }
 
 impl Deshredder {
-    pub fn new(max_wait_slots: u64) -> Self {
-        Self {
-            max_wait_slots,
-            rs_cache: ReedSolomonCache::default(),
-            slots: HashMap::new(),
-            max_slot: None,
-            warmup: Vec::new(),
-            rejected_in_a_row: 0,
-        }
+    pub fn insert_bytes(&mut self, payload: Bytes) -> Result<Vec<CompletedDataSet>, ShredError> {
+        let shred = Shred::new_from_serialized_shred(payload)?;
+        Ok(self.insert_shred(shred))
     }
 
-    pub fn pending_slots(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub fn insert(&mut self, payload: Bytes) -> ShredInsertionResult {
-        match Shred::new_from_serialized_shred(payload) {
-            Ok(shred) => self.insert_shred(shred),
-            Err(_) => ShredInsertionResult::default(),
-        }
-    }
-
-    fn insert_shred(&mut self, shred: Shred) -> ShredInsertionResult {
-        let slot = shred.slot();
-        if !self.accept_slot(slot) {
-            return ShredInsertionResult::default();
+    fn insert_shred(&mut self, shred: Shred) -> Vec<CompletedDataSet> {
+        let Some(state) = slot_state(&mut self.slots, shred.slot()) else {
+            return Vec::new();
+        };
+        if state.finished {
+            return Vec::new();
         }
 
-        let index = shred.index();
-        let fec = shred.fec_set_index();
-        let state = self.slots.entry(slot).or_insert_with(SlotState::new);
-        let mut changed = None;
+        let shred_index = shred.index();
+        let fec_set_index = shred.fec_set_index();
+        let mut inserted_data_range = None;
         if shred.is_data() {
-            if state.insert_data(shred) {
-                changed = Some((index, index));
+            if state.insert_data_shred(shred) {
+                inserted_data_range = Some(shred_index..=shred_index);
             }
         } else {
-            state.insert_coding(shred);
+            state.insert_coding_shred(shred);
         }
 
-        let recovery = state.recover(fec, &self.rs_cache);
-        if let Some((num_data, stats)) = recovery
-            && stats.recovered > 0
-        {
-            changed = Some((fec, fec + num_data - 1));
-        }
-
-        let mut result = ShredInsertionResult {
-            recovery: recovery.map(|(_, stats)| stats),
-            ..ShredInsertionResult::default()
-        };
-        if let Some((first, last)) = changed {
-            for data_set in state.complete_data_sets(slot, first, last) {
-                match data_set {
-                    Some(data_set) => result.data_sets.push(data_set),
-                    None => result.decode_errors += 1,
-                }
-            }
-        }
-        result
-    }
-
-    fn accept_slot(&mut self, slot: u64) -> bool {
-        let Some(max_slot) = self.max_slot else {
-            self.warm_up(slot);
-            return true;
-        };
-        let too_old = max_slot.saturating_sub(slot) >= self.max_wait_slots;
-        let too_new = slot > max_slot.saturating_add(MAX_SLOTS_AHEAD);
-        if too_old || too_new {
-            self.rejected_in_a_row += 1;
-            if self.rejected_in_a_row < RESYNC_AFTER_REJECTED {
-                return false;
-            }
-            self.rejected_in_a_row = 0;
-            self.max_slot = None;
-            self.warm_up(slot);
-            return true;
-        }
-        self.rejected_in_a_row = 0;
-        if slot > max_slot {
-            self.max_slot = Some(slot);
-            self.evict(slot);
-        }
-        true
-    }
-
-    fn warm_up(&mut self, slot: u64) {
-        self.warmup.push(slot);
-        if self.warmup.len() < WARMUP_SHREDS {
-            return;
-        }
-        let middle = self.warmup.len() / 2;
-        let slot = *self.warmup.select_nth_unstable(middle).1;
-        self.warmup.clear();
-        self.max_slot = Some(slot);
-        self.evict(slot);
-    }
-
-    fn evict(&mut self, max_slot: u64) {
-        let (newest, oldest) = (
-            max_slot.saturating_add(MAX_SLOTS_AHEAD),
-            max_slot.saturating_sub(self.max_wait_slots - 1),
-        );
-        self.slots
-            .retain(|&pending, _| (oldest..=newest).contains(&pending));
-    }
-}
-
-struct CodingSet {
-    num_data: u32,
-    shreds: BTreeMap<u32, Shred>,
-    attempts: u8,
-}
-
-struct SlotState {
-    data: BTreeMap<u32, Shred>,
-    batch_ends: BTreeSet<u32>,
-    emitted: BTreeMap<u32, u32>,
-    coding: HashMap<u32, CodingSet>,
-}
-
-impl SlotState {
-    fn new() -> Self {
-        Self {
-            data: BTreeMap::new(),
-            batch_ends: BTreeSet::new(),
-            emitted: BTreeMap::new(),
-            coding: HashMap::new(),
-        }
-    }
-
-    fn is_emitted(&self, index: u32) -> bool {
-        self.emitted
-            .range(..=index)
-            .next_back()
-            .is_some_and(|(_, &end)| index <= end)
-    }
-
-    fn mark_emitted(&mut self, mut start: u32, mut end: u32) {
-        if let Some((&prev_start, &prev_end)) = self.emitted.range(..start).next_back()
-            && prev_end + 1 == start
-        {
-            self.emitted.remove(&prev_start);
-            start = prev_start;
-        }
-        if let Some(next_end) = self.emitted.remove(&(end + 1)) {
-            end = next_end;
-        }
-        self.emitted.insert(start, end);
-    }
-
-    fn insert_data(&mut self, shred: Shred) -> bool {
-        let index = shred.index();
-        if self.data.contains_key(&index) || self.is_emitted(index) {
-            return false;
-        }
-        if shred.data_complete() {
-            self.batch_ends.insert(index);
-        }
-        self.data.insert(index, shred);
-        true
-    }
-
-    fn insert_coding(&mut self, shred: Shred) {
-        let fec = shred.fec_set_index();
-        let Some(num_data) = coding_num_data(shred.payload().as_ref()) else {
-            return;
-        };
-        if self.missing(fec, num_data) == 0 {
-            return;
-        }
-        self.coding
-            .entry(fec)
-            .or_insert_with(|| CodingSet {
-                num_data,
-                shreds: BTreeMap::new(),
-                attempts: 0,
-            })
-            .shreds
-            .entry(shred.index())
-            .or_insert(shred);
-    }
-
-    fn missing(&self, fec: u32, num_data: u32) -> usize {
-        (fec..fec + num_data)
-            .filter(|index| !self.data.contains_key(index) && !self.is_emitted(*index))
-            .count()
-    }
-
-    fn recover(&mut self, fec: u32, cache: &ReedSolomonCache) -> Option<(u32, RecoveryStats)> {
-        let set = self.coding.get(&fec)?;
-        let num_data = set.num_data;
-        if self.missing(fec, num_data) == 0 {
-            self.coding.remove(&fec);
-            return None;
-        }
-        let available = self.data.range(fec..fec + num_data).count() + set.shreds.len();
-        if available < num_data as usize || set.attempts >= MAX_RECOVERY_ATTEMPTS {
-            return None;
-        }
-
-        let started = Instant::now();
-        let input: Vec<Shred> = self
-            .data
-            .range(fec..fec + num_data)
-            .map(|(_, shred)| shred.clone())
-            .chain(set.shreds.values().cloned())
-            .collect();
-        self.coding.get_mut(&fec)?.attempts += 1;
-        let recovered = recover(input, cache)
-            .ok()?
-            .flatten()
-            .filter(|shred| shred.is_data() && self.insert_data(shred.clone()))
-            .count();
-        if self.missing(fec, num_data) == 0 {
-            self.coding.remove(&fec);
-        }
-        Some((
-            num_data,
-            RecoveryStats {
-                elapsed: started.elapsed(),
-                recovered,
-            },
-        ))
-    }
-
-    fn complete_data_sets(
-        &mut self,
-        slot: u64,
-        first: u32,
-        last: u32,
-    ) -> Vec<Option<CompletedDataSet>> {
-        let mut start = self
-            .batch_ends
-            .range(..first)
-            .next_back()
-            .map_or(0, |end| end + 1);
-        let mut ends = Vec::new();
-        for &end in self.batch_ends.range(first..) {
-            ends.push(end);
-            if end > last {
-                break;
+        if let Some(recovery) = state.recover(fec_set_index, &self.reed_solomon_cache) {
+            self.stats.recoveries += 1;
+            self.stats.recovered_shreds += recovery.recovered_shreds as u64;
+            self.stats.recovery_time += recovery.elapsed;
+            if recovery.recovered_shreds > 0 {
+                inserted_data_range = Some(recovery.fec_set_data_range);
             }
         }
 
+        let Some(inserted_data_range) = inserted_data_range else {
+            return Vec::new();
+        };
         let mut data_sets = Vec::new();
-        for end in ends {
-            let complete = !self.is_emitted(start)
-                && self.data.range(start..=end).count() == (end - start + 1) as usize;
-            if complete {
-                data_sets.push(self.take_data_set(slot, start, end));
+        for data_set in state.take_completed_data_sets(inserted_data_range) {
+            match data_set {
+                Some(data_set) => data_sets.push(data_set),
+                None => self.stats.decode_errors += 1,
             }
-            start = end + 1;
         }
         data_sets
     }
 
-    fn take_data_set(&mut self, slot: u64, start: u32, end: u32) -> Option<CompletedDataSet> {
-        let mut rest = self.data.split_off(&(end + 1));
-        let batch = self.data.split_off(&start);
-        self.data.append(&mut rest);
-        self.mark_emitted(start, end);
-        let done: Vec<u32> = self
-            .coding
-            .iter()
-            .filter(|&(&fec, set)| {
-                fec <= end && fec + set.num_data > start && self.missing(fec, set.num_data) == 0
-            })
-            .map(|(&fec, _)| fec)
-            .collect();
-        for fec in done {
-            self.coding.remove(&fec);
-        }
-
-        let bytes = Shredder::deshred(batch.values().map(Shred::payload)).ok()?;
-        let entries =
-            <WincodeVec<Entry, MaxDataShredsLen> as Deserialize>::deserialize(&bytes).ok()?;
-        Some(CompletedDataSet {
-            slot,
-            start,
-            end,
-            entries,
-        })
+    pub fn stats(&self) -> &DeshredStats {
+        &self.stats
     }
 }
 
-fn coding_num_data(payload: &[u8]) -> Option<u32> {
-    let bytes = payload.get(SIZE_OF_COMMON_SHRED_HEADER..SIZE_OF_COMMON_SHRED_HEADER + 2)?;
-    let num_data = u16::from_le_bytes(bytes.try_into().ok()?);
-    (num_data > 0).then_some(u32::from(num_data))
+fn slot_state(slots: &mut [Option<SlotState>], slot: u64) -> Option<&mut SlotState> {
+    let entry = &mut slots[(slot % SLOT_HISTORY_SIZE) as usize];
+    match entry {
+        Some(state) if state.slot > slot => return None,
+        Some(state) if state.slot == slot => {}
+        _ => *entry = Some(SlotState::new(slot)),
+    }
+    entry.as_mut()
+}
+
+struct CodingSet {
+    fec_set_index: u32,
+    num_data_shreds: u32,
+    coding_shreds: Vec<Shred>,
+    recovery_attempts: u8,
+}
+
+impl CodingSet {
+    fn data_range(&self) -> RangeInclusive<u32> {
+        self.fec_set_index..=self.fec_set_index + self.num_data_shreds - 1
+    }
+}
+
+struct RecoveryStats {
+    fec_set_data_range: RangeInclusive<u32>,
+    elapsed: Duration,
+    recovered_shreds: usize,
+}
+
+enum DataShred {
+    Missing,
+    Held(Shred),
+    Emitted,
+}
+
+struct SlotState {
+    slot: u64,
+    data_shreds: Vec<DataShred>,
+    data_set_ends: Vec<u64>,
+    coding_sets: Vec<CodingSet>,
+    last_shred_index: Option<u32>,
+    emitted_shreds: u32,
+    finished: bool,
+}
+
+impl SlotState {
+    fn new(slot: u64) -> Self {
+        Self {
+            slot,
+            data_shreds: Vec::new(),
+            data_set_ends: Vec::new(),
+            coding_sets: Vec::new(),
+            last_shred_index: None,
+            emitted_shreds: 0,
+            finished: false,
+        }
+    }
+
+    fn is_held(&self, shred_index: u32) -> bool {
+        matches!(
+            self.data_shreds.get(shred_index as usize),
+            Some(DataShred::Held(_))
+        )
+    }
+
+    fn insert_data_shred(&mut self, shred: Shred) -> bool {
+        let shred_index = shred.index() as usize;
+        if shred_index >= self.data_shreds.len() {
+            self.data_shreds
+                .resize_with(shred_index + 1, || DataShred::Missing);
+        }
+        if !matches!(self.data_shreds[shred_index], DataShred::Missing) {
+            return false;
+        }
+        if shred.data_complete() {
+            set_bit(&mut self.data_set_ends, shred_index);
+        }
+        if shred.last_in_slot() {
+            self.last_shred_index = Some(shred_index as u32);
+        }
+        self.data_shreds[shred_index] = DataShred::Held(shred);
+        true
+    }
+
+    fn insert_coding_shred(&mut self, shred: Shred) {
+        let fec_set_index = shred.fec_set_index();
+        let Some(num_data_shreds) = num_data_shreds(shred.payload().as_ref()) else {
+            return;
+        };
+        let data_range = fec_set_index..=fec_set_index + num_data_shreds - 1;
+        if missing_data_shreds(&self.data_shreds, data_range) == 0 {
+            return;
+        }
+        let position = match self
+            .coding_sets
+            .iter()
+            .position(|coding_set| coding_set.fec_set_index == fec_set_index)
+        {
+            Some(position) => position,
+            None => {
+                self.coding_sets.push(CodingSet {
+                    fec_set_index,
+                    num_data_shreds,
+                    coding_shreds: Vec::new(),
+                    recovery_attempts: 0,
+                });
+                self.coding_sets.len() - 1
+            }
+        };
+        let coding_shreds = &mut self.coding_sets[position].coding_shreds;
+        if !coding_shreds
+            .iter()
+            .any(|held| held.index() == shred.index())
+        {
+            coding_shreds.push(shred);
+        }
+    }
+
+    fn recover(&mut self, fec_set_index: u32, cache: &ReedSolomonCache) -> Option<RecoveryStats> {
+        let position = self
+            .coding_sets
+            .iter()
+            .position(|coding_set| coding_set.fec_set_index == fec_set_index)?;
+        let coding_set = &self.coding_sets[position];
+        let data_range = coding_set.data_range();
+        if missing_data_shreds(&self.data_shreds, data_range.clone()) == 0 {
+            self.coding_sets.swap_remove(position);
+            return None;
+        }
+        let held = data_range
+            .clone()
+            .filter(|&index| self.is_held(index))
+            .count();
+        if held + coding_set.coding_shreds.len() < coding_set.num_data_shreds as usize
+            || coding_set.recovery_attempts >= MAX_RECOVERY_ATTEMPTS
+        {
+            return None;
+        }
+
+        let started = Instant::now();
+        let recovery_input: Vec<Shred> = data_range
+            .clone()
+            .filter_map(|index| match self.data_shreds.get(index as usize) {
+                Some(DataShred::Held(shred)) => Some(shred.clone()),
+                _ => None,
+            })
+            .chain(coding_set.coding_shreds.iter().cloned())
+            .collect();
+        self.coding_sets[position].recovery_attempts += 1;
+        let recovered_shreds = recover(recovery_input, cache)
+            .ok()?
+            .flatten()
+            .filter(|shred| shred.is_data() && self.insert_data_shred(shred.clone()))
+            .count();
+        if missing_data_shreds(&self.data_shreds, data_range.clone()) == 0 {
+            self.coding_sets.swap_remove(position);
+        }
+        Some(RecoveryStats {
+            fec_set_data_range: data_range,
+            elapsed: started.elapsed(),
+            recovered_shreds,
+        })
+    }
+
+    fn take_completed_data_sets(
+        &mut self,
+        inserted_data_range: RangeInclusive<u32>,
+    ) -> Vec<Option<CompletedDataSet>> {
+        let (inserted_start, inserted_end) = inserted_data_range.into_inner();
+        let mut data_set_start =
+            last_bit_before(&self.data_set_ends, inserted_start).map_or(0, |end| end + 1);
+        let mut search_from = inserted_start;
+        let mut data_sets = Vec::new();
+        while let Some(data_set_end) = next_bit_from(&self.data_set_ends, search_from) {
+            if (data_set_start..=data_set_end).all(|index| self.is_held(index)) {
+                data_sets.push(self.take_data_set(data_set_start..=data_set_end));
+            }
+            if data_set_end > inserted_end {
+                break;
+            }
+            data_set_start = data_set_end + 1;
+            search_from = data_set_start;
+        }
+        data_sets
+    }
+
+    fn take_data_set(&mut self, range: RangeInclusive<u32>) -> Option<CompletedDataSet> {
+        let (start, end) = (*range.start(), *range.end());
+        let mut data_shreds = Vec::with_capacity((end - start + 1) as usize);
+        for entry in &mut self.data_shreds[start as usize..=end as usize] {
+            if let DataShred::Held(shred) = std::mem::replace(entry, DataShred::Emitted) {
+                data_shreds.push(shred);
+            }
+        }
+        self.emitted_shreds += end - start + 1;
+        let emitted = &self.data_shreds;
+        self.coding_sets.retain(|coding_set| {
+            let data_range = coding_set.data_range();
+            let overlaps = *data_range.start() <= end && *data_range.end() >= start;
+            !overlaps || missing_data_shreds(emitted, data_range) > 0
+        });
+        if self
+            .last_shred_index
+            .is_some_and(|last| self.emitted_shreds == last + 1)
+        {
+            self.finish();
+        }
+
+        let bytes = Shredder::deshred(data_shreds.iter().map(Shred::payload)).ok()?;
+        let entries =
+            <WincodeVec<Entry, MaxDataShredsLen> as Deserialize>::deserialize(&bytes).ok()?;
+        Some(CompletedDataSet {
+            slot: self.slot,
+            start_shred_index: start,
+            end_shred_index: end,
+            entries,
+        })
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.data_shreds = Vec::new();
+        self.data_set_ends = Vec::new();
+        self.coding_sets = Vec::new();
+    }
+}
+
+fn missing_data_shreds(data_shreds: &[DataShred], data_range: RangeInclusive<u32>) -> usize {
+    data_range
+        .filter(|&index| {
+            matches!(
+                data_shreds.get(index as usize),
+                None | Some(DataShred::Missing)
+            )
+        })
+        .count()
+}
+
+fn set_bit(bits: &mut Vec<u64>, index: usize) {
+    let word = index / 64;
+    if word >= bits.len() {
+        bits.resize(word + 1, 0);
+    }
+    bits[word] |= 1 << (index % 64);
+}
+
+fn last_bit_before(bits: &[u64], index: u32) -> Option<u32> {
+    let index = index as usize;
+    let (mut word, mut mask) = match bits.get(index / 64) {
+        Some(bits) => (index / 64, bits & ((1u64 << (index % 64)) - 1)),
+        None => (bits.len(), 0),
+    };
+    loop {
+        if mask != 0 {
+            return Some((word * 64 + 63 - mask.leading_zeros() as usize) as u32);
+        }
+        word = word.checked_sub(1)?;
+        mask = bits[word];
+    }
+}
+
+fn next_bit_from(bits: &[u64], index: u32) -> Option<u32> {
+    let index = index as usize;
+    let mut word = index / 64;
+    let mut mask = bits.get(word)? & (u64::MAX << (index % 64));
+    loop {
+        if mask != 0 {
+            return Some((word * 64 + mask.trailing_zeros() as usize) as u32);
+        }
+        word += 1;
+        mask = *bits.get(word)?;
+    }
+}
+
+fn num_data_shreds(coding_shred_payload: &[u8]) -> Option<u32> {
+    let bytes =
+        coding_shred_payload.get(SIZE_OF_COMMON_SHRED_HEADER..SIZE_OF_COMMON_SHRED_HEADER + 2)?;
+    let num_data_shreds = u16::from_le_bytes(bytes.try_into().ok()?);
+    (num_data_shreds > 0).then_some(u32::from(num_data_shreds))
 }
 
 #[cfg(test)]
@@ -389,19 +428,13 @@ mod tests {
             )
     }
 
-    fn warm_up(deshredder: &mut Deshredder, shred: &Shred) {
-        for _ in 0..WARMUP_SHREDS {
-            deshredder.insert_shred(shred.clone());
-        }
-    }
-
     fn insert_all(
         deshredder: &mut Deshredder,
         shreds: impl IntoIterator<Item = Shred>,
     ) -> Vec<CompletedDataSet> {
         shreds
             .into_iter()
-            .flat_map(|shred| deshredder.insert_shred(shred).data_sets)
+            .flat_map(|shred| deshredder.insert_shred(shred))
             .collect()
     }
 
@@ -409,7 +442,7 @@ mod tests {
     fn coding_shreds_report_the_fec_sets_data_count() {
         let (_, coding) = shred(&entries(1_000), 0, false);
         assert_eq!(
-            coding_num_data(coding[0].payload().as_ref()),
+            num_data_shreds(coding[0].payload().as_ref()),
             Some(DATA_SHREDS_PER_FEC_BLOCK as u32)
         );
     }
@@ -420,11 +453,15 @@ mod tests {
         let (data, _) = shred(&entries, 0, false);
         let last = data.last().unwrap().index();
 
-        let completed = insert_all(&mut Deshredder::new(5), data);
+        let completed = insert_all(&mut Deshredder::default(), data);
 
         assert_eq!(completed.len(), 1);
         assert_eq!(
-            (completed[0].slot, completed[0].start, completed[0].end),
+            (
+                completed[0].slot,
+                completed[0].start_shred_index,
+                completed[0].end_shred_index
+            ),
             (SLOT, 0, last)
         );
         assert_eq!(completed[0].entries, entries);
@@ -436,7 +473,7 @@ mod tests {
         let (data, coding) = shred(&entries, 0, false);
         let dropped = &data[DATA_SHREDS_PER_FEC_BLOCK / 2];
         let (dropped_index, dropped_fec) = (dropped.index(), dropped.fec_set_index());
-        let mut deshredder = Deshredder::new(5);
+        let mut deshredder = Deshredder::default();
 
         let without_dropped = data.into_iter().filter(|s| s.index() != dropped_index);
         assert!(insert_all(&mut deshredder, without_dropped).is_empty());
@@ -453,16 +490,15 @@ mod tests {
     fn reports_the_recovery() {
         let (data, coding) = shred(&entries(1_000), 0, false);
         let fec = data[0].fec_set_index();
-        let mut deshredder = Deshredder::new(5);
+        let mut deshredder = Deshredder::default();
         insert_all(&mut deshredder, data.into_iter().skip(1));
 
-        let recoveries: Vec<RecoveryStats> = coding
-            .into_iter()
-            .filter(|s| s.fec_set_index() == fec)
-            .filter_map(|s| deshredder.insert_shred(s).recovery)
-            .collect();
-        assert_eq!(recoveries.len(), 1);
-        assert_eq!(recoveries[0].recovered, 1);
+        insert_all(
+            &mut deshredder,
+            coding.into_iter().filter(|s| s.fec_set_index() == fec),
+        );
+        let stats = deshredder.stats();
+        assert_eq!((stats.recoveries, stats.recovered_shreds), (1, 1));
     }
 
     #[test]
@@ -471,26 +507,28 @@ mod tests {
         let fec = data[0].fec_set_index();
         let num_data = DATA_SHREDS_PER_FEC_BLOCK as u32;
         let missing = fec + num_data - 1;
-        let mut state = SlotState::new();
-        state.mark_emitted(fec, fec + num_data / 2 - 1);
+        let mut state = SlotState::new(SLOT);
+        state
+            .data_shreds
+            .resize_with((fec + num_data / 2) as usize, || DataShred::Emitted);
         for shred in data.into_iter().filter(|s| s.index() != missing) {
-            state.insert_data(shred);
+            state.insert_data_shred(shred);
         }
         let mut coding = coding.into_iter().filter(|s| s.fec_set_index() == fec);
         let cache = ReedSolomonCache::default();
 
-        state.insert_coding(coding.next().unwrap());
+        state.insert_coding_shred(coding.next().unwrap());
         assert!(state.recover(fec, &cache).is_none());
-        assert_eq!(state.coding[&fec].attempts, 0);
+        assert_eq!(state.coding_sets[0].recovery_attempts, 0);
 
-        let held = state.data.range(fec..fec + num_data).count() + 1;
+        let held = (fec..fec + num_data).filter(|&i| state.is_held(i)).count() + 1;
         for shred in coding.take(num_data as usize - held) {
-            state.insert_coding(shred);
+            state.insert_coding_shred(shred);
         }
-        let (_, recovery) = state.recover(fec, &cache).unwrap();
-        assert_eq!(recovery.recovered, 1);
-        assert!(state.data.contains_key(&missing));
-        assert!(!state.coding.contains_key(&fec));
+        let recovery = state.recover(fec, &cache).unwrap();
+        assert_eq!(recovery.recovered_shreds, 1);
+        assert!(state.is_held(missing));
+        assert!(state.coding_sets.is_empty());
     }
 
     #[test]
@@ -503,33 +541,37 @@ mod tests {
         payload[SIZE_OF_DATA_SHRED_HEADERS..][..8].fill(0xff);
         first[0] = Shred::new_from_serialized_shred(payload).unwrap();
 
-        let mut deshredder = Deshredder::new(5);
-        let results: Vec<ShredInsertionResult> = first
-            .into_iter()
-            .chain(second)
-            .map(|s| deshredder.insert_shred(s))
-            .collect();
+        let mut deshredder = Deshredder::default();
+        let completed = insert_all(&mut deshredder, first.into_iter().chain(second));
 
-        assert_eq!(results.iter().map(|r| r.decode_errors).sum::<usize>(), 1);
-        let completed: Vec<_> = results.into_iter().flat_map(|r| r.data_sets).collect();
+        assert_eq!(deshredder.stats().decode_errors, 1);
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].start, next);
+        assert_eq!(completed[0].start_shred_index, next);
         assert_eq!(completed[0].entries, entries);
     }
 
     #[test]
-    fn drops_slots_left_behind_by_the_stream() {
-        let mut deshredder = Deshredder::new(2);
+    fn a_slot_is_replaced_by_the_one_a_full_history_later() {
         let (old, _) = shred(&entries(10), 0, false);
-        warm_up(&mut deshredder, &old[0]);
-        assert_eq!(deshredder.pending_slots(), 1);
+        let (new, _) = shred_in_slot(SLOT + SLOT_HISTORY_SIZE, &entries(10), 0, false);
+        let mut deshredder = Deshredder::default();
+        let held = |deshredder: &Deshredder| {
+            deshredder
+                .slots
+                .iter()
+                .flatten()
+                .map(|state| state.slot)
+                .collect::<Vec<_>>()
+        };
 
-        let (new, _) = shred_in_slot(SLOT + 2, &entries(10), 0, false);
+        deshredder.insert_shred(old[0].clone());
+        assert_eq!(held(&deshredder), [SLOT]);
+
         deshredder.insert_shred(new[0].clone());
-        assert_eq!(deshredder.pending_slots(), 1);
+        assert_eq!(held(&deshredder), [SLOT + SLOT_HISTORY_SIZE]);
 
         deshredder.insert_shred(old[1].clone());
-        assert_eq!(deshredder.pending_slots(), 1);
+        assert_eq!(held(&deshredder), [SLOT + SLOT_HISTORY_SIZE]);
     }
 
     #[test]
@@ -539,72 +581,46 @@ mod tests {
         let next = first.last().unwrap().index() + 1;
         let (second, _) = shred(&entries, next, true);
         let lost = first[0].clone();
-        let mut deshredder = Deshredder::new(5);
+        let mut deshredder = Deshredder::default();
 
         let completed = insert_all(&mut deshredder, first.into_iter().skip(1).chain(second));
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].start, next);
+        assert_eq!(completed[0].start_shred_index, next);
 
         let completed = insert_all(&mut deshredder, [lost.clone(), lost]);
         assert_eq!(completed.len(), 1);
-        assert_eq!((completed[0].start, completed[0].end), (0, next - 1));
-        assert_eq!(completed[0].entries, entries);
-    }
-
-    #[test]
-    fn a_shred_with_a_bogus_slot_does_not_stall_the_stream() {
-        let entries = entries(10);
-        let (data, _) = shred(&entries, 0, true);
-        let mut payload = data[0].payload().to_vec();
-        payload[65..73].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
-        let bogus = Shred::new_from_serialized_shred(payload).unwrap();
-
-        let mut deshredder = Deshredder::new(5);
-        let completed = insert_all(
-            &mut deshredder,
-            std::iter::once(bogus.clone()).chain(data.clone()),
-        );
-        assert_eq!(completed.len(), 1, "bogus shred first");
-        assert_eq!(completed[0].entries, entries);
-
-        let mut deshredder = Deshredder::new(5);
-        warm_up(&mut deshredder, &data[0]);
-        let completed = insert_all(&mut deshredder, std::iter::once(bogus).chain(data));
-        assert_eq!(completed.len(), 1, "bogus shred after warm-up");
-        assert_eq!(deshredder.max_slot, Some(SLOT));
-    }
-
-    #[test]
-    fn a_bogus_shred_during_warm_up_does_not_pick_the_slot() {
-        let (data, _) = shred(&entries(10), 0, false);
-        let mut payload = data[0].payload().to_vec();
-        payload[65..73].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
-        let bogus = Shred::new_from_serialized_shred(payload).unwrap();
-        let mut deshredder = Deshredder::new(5);
-
-        deshredder.insert_shred(bogus);
-        warm_up(&mut deshredder, &data[0]);
-        assert_eq!(deshredder.max_slot, Some(SLOT));
-        assert_eq!(deshredder.slots.keys().collect::<Vec<_>>(), [&SLOT]);
-    }
-
-    #[test]
-    fn resyncs_when_the_stream_really_jumps() {
-        let (old, _) = shred(&entries(10), 0, false);
-        let (new, _) = shred_in_slot(SLOT + 1_000, &entries(10), 0, false);
-        let mut deshredder = Deshredder::new(5);
-        warm_up(&mut deshredder, &old[0]);
-
-        for _ in 1..RESYNC_AFTER_REJECTED {
-            deshredder.insert_shred(new[0].clone());
-        }
-        assert_eq!(deshredder.slots.keys().collect::<Vec<_>>(), [&SLOT]);
-
-        warm_up(&mut deshredder, &new[0]);
-        assert_eq!(deshredder.max_slot, Some(SLOT + 1_000));
         assert_eq!(
-            deshredder.slots.keys().collect::<Vec<_>>(),
-            [&(SLOT + 1_000)]
+            (completed[0].start_shred_index, completed[0].end_shred_index),
+            (0, next - 1)
         );
+        assert_eq!(completed[0].entries, entries);
+    }
+
+    #[test]
+    fn a_finished_slot_frees_its_shreds_and_ignores_late_ones() {
+        let entries = entries(1_000);
+        let (data, coding) = shred(&entries, 0, true);
+        let mut deshredder = Deshredder::default();
+
+        assert_eq!(insert_all(&mut deshredder, data.clone()).len(), 1);
+        let state = deshredder.slots.iter().flatten().next().unwrap();
+        assert!(state.finished && state.data_shreds.is_empty());
+
+        assert!(insert_all(&mut deshredder, coding.into_iter().chain(data)).is_empty());
+        assert_eq!(deshredder.stats().recoveries, 0);
+    }
+
+    #[test]
+    fn finds_data_set_ends_across_words() {
+        let mut bits = Vec::new();
+        for index in [3, 64, 200] {
+            set_bit(&mut bits, index);
+        }
+        assert_eq!(last_bit_before(&bits, 3), None);
+        assert_eq!(last_bit_before(&bits, 64), Some(3));
+        assert_eq!(last_bit_before(&bits, 1_000), Some(200));
+        assert_eq!(next_bit_from(&bits, 4), Some(64));
+        assert_eq!(next_bit_from(&bits, 65), Some(200));
+        assert_eq!(next_bit_from(&bits, 201), None);
     }
 }

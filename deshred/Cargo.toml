@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [features]
-verify = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:solana-address", "dep:solana-signature", "dep:ureq"]
+verify = ["dep:thiserror", "dep:serde", "dep:serde_json", "dep:solana-address", "dep:solana-signature", "dep:ureq"]
 
 [dependencies]
 bytes = "1.11.0"
@@ -16,9 +16,9 @@ solana-transaction = "4.2.0"
 solana-message = "4.5.0"
 wincode = "0.6.1"
 
-anyhow = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
 solana-address = { version = "2", features = ["decode"], optional = true }
 solana-signature = { version = "3.1", features = ["verify"], optional = true }
 ureq = { version = "2", features = ["json"], optional = true }

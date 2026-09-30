@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solana_address::Address;
@@ -15,6 +14,35 @@ const EPOCHS_KEPT: usize = 3;
 const SLOTS_CACHED: u64 = 64;
 const MAX_ROOTS_PER_SLOT: usize = 4_096;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScheduleError {
+    #[error("rpc {method}: {source}")]
+    Transport {
+        method: &'static str,
+        source: Box<ureq::Error>,
+    },
+    #[error("rpc {method}: unreadable response: {source}")]
+    Response {
+        method: &'static str,
+        source: std::io::Error,
+    },
+    #[error("rpc {method} failed: {error}")]
+    Rpc { method: &'static str, error: Value },
+    #[error("rpc {method}: unexpected result: {source}")]
+    Result {
+        method: &'static str,
+        source: serde_json::Error,
+    },
+    #[error("bad leader pubkey {0}")]
+    BadPubkey(String),
+    #[error("leader schedule from slot {first_slot} covers {covered} of {slots} slots")]
+    Incomplete {
+        first_slot: u64,
+        covered: usize,
+        slots: u64,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -43,7 +71,11 @@ impl LeaderSchedule {
         leaders.get((slot - first_slot) as usize).copied()
     }
 
-    pub fn refresh_from_rpc(&self, url: &str, headers: &[(&str, &str)]) -> Result<()> {
+    pub fn refresh_from_rpc(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(), ScheduleError> {
         let rpc = Rpc { url, headers };
         let info: EpochInfo = rpc.call("getEpochInfo", json!([]))?;
         let first_slot = info.absolute_slot - info.slot_index;
@@ -54,8 +86,7 @@ impl LeaderSchedule {
             let schedule: Option<HashMap<String, Vec<u64>>> =
                 rpc.call("getLeaderSchedule", json!([first_slot]))?;
             if let Some(schedule) = schedule {
-                let leaders = leaders_by_slot(schedule, info.slots_in_epoch)
-                    .with_context(|| format!("leader schedule from slot {first_slot}"))?;
+                let leaders = leaders_by_slot(schedule, first_slot, info.slots_in_epoch)?;
                 self.insert_epoch(first_slot, leaders);
             }
         }
@@ -120,12 +151,16 @@ fn verdict(valid: bool) -> Verdict {
     }
 }
 
-fn leaders_by_slot(schedule: HashMap<String, Vec<u64>>, slots: u64) -> Result<Vec<Address>> {
+fn leaders_by_slot(
+    schedule: HashMap<String, Vec<u64>>,
+    first_slot: u64,
+    slots: u64,
+) -> Result<Vec<Address>, ScheduleError> {
     let mut leaders = vec![None; slots as usize];
     for (leader, indexes) in schedule {
         let leader: Address = leader
             .parse()
-            .map_err(|_| anyhow!("bad leader pubkey {leader}"))?;
+            .map_err(|_| ScheduleError::BadPubkey(leader.clone()))?;
         for index in indexes {
             if let Some(slot) = leaders.get_mut(index as usize) {
                 *slot = Some(leader);
@@ -133,11 +168,13 @@ fn leaders_by_slot(schedule: HashMap<String, Vec<u64>>, slots: u64) -> Result<Ve
         }
     }
     let leaders: Vec<Address> = leaders.into_iter().flatten().collect();
-    ensure!(
-        leaders.len() == slots as usize,
-        "covers {} of {slots} slots",
-        leaders.len()
-    );
+    if leaders.len() != slots as usize {
+        return Err(ScheduleError::Incomplete {
+            first_slot,
+            covered: leaders.len(),
+            slots,
+        });
+    }
     Ok(leaders)
 }
 
@@ -155,7 +192,11 @@ struct Rpc<'a> {
 }
 
 impl Rpc<'_> {
-    fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value) -> Result<T> {
+    fn call<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<T, ScheduleError> {
         #[derive(Deserialize)]
         struct Response {
             result: Option<Value>,
@@ -168,14 +209,17 @@ impl Rpc<'_> {
         }
         let response: Response = request
             .send_json(json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
-            .with_context(|| format!("rpc {method}"))?
+            .map_err(|source| ScheduleError::Transport {
+                method,
+                source: Box::new(source),
+            })?
             .into_json()
-            .with_context(|| format!("rpc {method}: bad response"))?;
+            .map_err(|source| ScheduleError::Response { method, source })?;
         if let Some(error) = response.error {
-            return Err(anyhow!("rpc {method}: {error}"));
+            return Err(ScheduleError::Rpc { method, error });
         }
         serde_json::from_value(response.result.unwrap_or(Value::Null))
-            .with_context(|| format!("rpc {method}: unexpected result"))
+            .map_err(|source| ScheduleError::Result { method, source })
     }
 }
 
@@ -273,7 +317,10 @@ mod tests {
         let (a, b) = (Address::new_unique(), Address::new_unique());
         let schedule = HashMap::from([(a.to_string(), vec![0, 2]), (b.to_string(), vec![1])]);
 
-        assert_eq!(leaders_by_slot(schedule.clone(), 3).unwrap(), [a, b, a]);
-        assert!(leaders_by_slot(schedule, 4).is_err());
+        assert_eq!(leaders_by_slot(schedule.clone(), 0, 3).unwrap(), [a, b, a]);
+        assert!(matches!(
+            leaders_by_slot(schedule, 0, 4),
+            Err(ScheduleError::Incomplete { covered: 3, .. })
+        ));
     }
 }

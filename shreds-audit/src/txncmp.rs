@@ -84,7 +84,7 @@ impl TxnCompare {
 
         // Bounded: a stalled deshredder drops feed instead of growing a backlog.
         let (feed, feed_rx) = crossbeam_channel::bounded::<ShredInput>(131_072);
-        let deshredder = Deshredder::new(reg.clone(), cfg.fec_max_wait_slots);
+        let deshredder = Deshredder::new(reg.clone());
         let deshred_handle = std::thread::Builder::new()
             .name("deshred".into())
             .spawn(move || deshredder.run(feed_rx))

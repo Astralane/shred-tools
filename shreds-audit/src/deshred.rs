@@ -16,15 +16,13 @@ pub struct ShredInput {
 
 pub struct Deshredder {
     reg: Arc<Mutex<SigRegistry>>,
-    max_wait_slots: u64,
     streams: HashMap<u16, ::deshred::Deshredder>,
 }
 
 impl Deshredder {
-    pub fn new(reg: Arc<Mutex<SigRegistry>>, max_wait_slots: u64) -> Self {
+    pub fn new(reg: Arc<Mutex<SigRegistry>>) -> Self {
         Self {
             reg,
-            max_wait_slots,
             streams: HashMap::new(),
         }
     }
@@ -36,13 +34,10 @@ impl Deshredder {
     }
 
     fn ingest(&mut self, input: ShredInput) {
-        let max_wait_slots = self.max_wait_slots;
-        let completed = self
-            .streams
-            .entry(input.provider)
-            .or_insert_with(|| ::deshred::Deshredder::new(max_wait_slots))
-            .insert(input.data)
-            .data_sets;
+        let stream = self.streams.entry(input.provider).or_default();
+        let Ok(completed) = stream.insert_bytes(input.data) else {
+            return;
+        };
         if completed.is_empty() {
             return;
         }
