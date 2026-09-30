@@ -52,8 +52,10 @@ Open `config.yaml` in any editor. Two things need to match your setup:
 - `providers` — one entry per provider: a name you choose, and the port that
   provider sends to.
 
-For two providers on ports 20001 and 20002 that is the whole file — everything
-else in the example is optional and already has a working default:
+Everything else in the example is optional and set to its default, except
+`grpc_sources`: its entries point at placeholder URLs, so delete them unless you
+have those feeds. For two providers on ports 20001 and 20002 this is the whole
+file:
 
 ```yaml
 rpc_url: "https://api.mainnet-beta.solana.com"
@@ -171,7 +173,7 @@ Copy the example and edit it:
 cp config.example.yaml config.yaml
 ```
 
-The example file is fully commented — walk through it top to bottom. The core of
+The example file lists every setting with its default value. The core of
 it is: give each provider its own UDP port (or identify it by source IP), and
 list every port under `listen_ports`.
 
@@ -202,7 +204,7 @@ If you add a `grpc_sources` block to your config, the tool additionally compares
 your shred stream against one or more Geyser/Yellowstone gRPC feeds by
 transaction arrival time, and reports which source delivered each transaction
 first. If you don't add that block, nothing changes — this is entirely opt-in.
-See the commented `grpc_sources` section in `config.example.yaml`.
+See the `grpc_sources` section in `config.example.yaml`.
 
 Each source can use either the standard post-execution transaction subscription
 or the separate pre-execution `SubscribeDeshred` API:

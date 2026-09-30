@@ -695,4 +695,11 @@ grpc_sources:
         .unwrap();
         assert_eq!(ok.filter_rotation.effective_bundles()[0].name, "mine");
     }
+
+    #[test]
+    fn the_example_config_is_valid() {
+        let cfg = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml")).unwrap();
+        assert_eq!(cfg.providers.len(), 3);
+        assert_eq!(cfg.grpc_sources.len(), 3);
+    }
 }
