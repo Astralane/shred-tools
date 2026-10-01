@@ -25,6 +25,17 @@ const RETRY_AFTER: Duration = Duration::from_secs(4);
 const BLOCK_CACHE: usize = 12;
 const GIVE_UP_SECS: u64 = 600;
 const LOCAL_VIOLATION_CAP: u64 = 25;
+/// Hard ceiling on getBlock calls, whatever the windows ask for: at most one
+/// every 500 ms. The steady state is one per `sample_every_slots` slots (~0.25/s
+/// at 10), so this only ever bites when something is wrong — and then it keeps a
+/// bug from turning into a flood against a paid provider.
+const MIN_CALL_GAP: Duration = Duration::from_millis(500);
+/// Network calls per tick; the rest wait for the next tick.
+const MAX_CALLS_PER_TICK: usize = 4;
+/// After an RPC error (429, transport, anything but "not available yet") every
+/// fetch pauses, doubling from the first to the last of these until a success.
+const BACKOFF_MIN: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(120);
 
 const RPC_SLOT_SKIPPED: i64 = -32007;
 const RPC_LONG_TERM_STORAGE_SLOT_SKIPPED: i64 = -32009;
@@ -47,6 +58,8 @@ pub fn spawn(
         retries: VecDeque::new(),
         cache: VecDeque::new(),
         failing: false,
+        last_call: None,
+        backoff: None,
     };
     std::thread::Builder::new()
         .name("filter-check".into())
@@ -78,6 +91,9 @@ struct Worker {
     retries: VecDeque<Retry>,
     cache: VecDeque<(u64, Arc<Block>)>,
     failing: bool,
+    last_call: Option<Instant>,
+    /// Paused until, and the pause to use next time.
+    backoff: Option<(Instant, Duration)>,
 }
 
 impl Worker {
@@ -114,7 +130,21 @@ impl Worker {
         for t in tasks {
             by_slot.entry(t.slot).or_default().push(t);
         }
+        let mut calls = 0;
         for (slot, tasks) in by_slot {
+            let cached = self.cache.iter().any(|(s, _)| *s == slot);
+            if !cached {
+                let paused = self.backoff.and_then(|(until, _)| (until > Instant::now()).then_some(until));
+                if paused.is_some() || calls >= MAX_CALLS_PER_TICK {
+                    // Wait without spending an attempt: the slot is not at fault.
+                    let not_before = paused.unwrap_or_else(Instant::now);
+                    for task in tasks {
+                        self.retries.push_back(Retry { task, not_before });
+                    }
+                    continue;
+                }
+                calls += 1;
+            }
             let attempt = tasks.iter().map(|t| t.attempts).max().unwrap_or(0) + 1;
             match self.fetch(slot, attempt) {
                 Some(fetched) => {
@@ -158,6 +188,13 @@ impl Worker {
         if let Some((_, b)) = self.cache.iter().find(|(s, _)| *s == slot) {
             return Some(Fetched::Block(b.clone()));
         }
+        if let Some(last) = self.last_call {
+            let wait = MIN_CALL_GAP.saturating_sub(last.elapsed());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
+        self.last_call = Some(Instant::now());
         let started = Instant::now();
         let result = get_block(&self.rpc, slot);
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -195,19 +232,26 @@ impl Worker {
                     "error"
                 };
                 row.error = Some(format!("{e:#}"));
-                if !not_available && !self.failing {
-                    self.failing = true;
-                    eprintln!(
-                        "filter-audit: getBlock({slot}) via {} failed: {e:#}",
-                        self.rpc.label()
-                    );
+                if !not_available {
+                    let pause = self.backoff.map_or(BACKOFF_MIN, |(_, p)| p);
+                    self.backoff = Some((Instant::now() + pause, (pause * 2).min(BACKOFF_MAX)));
+                    if !self.failing {
+                        self.failing = true;
+                        eprintln!(
+                            "filter-audit: getBlock({slot}) via {} failed: {e:#} — backing off",
+                            self.rpc.label()
+                        );
+                    }
                 }
                 None
             }
         };
-        if out.is_some() && self.failing {
-            self.failing = false;
-            eprintln!("filter-audit: getBlock recovered");
+        if out.is_some() {
+            self.backoff = None;
+            if self.failing {
+                self.failing = false;
+                eprintln!("filter-audit: getBlock recovered");
+            }
         }
         self.db.send(Row::Fetch(row));
         out

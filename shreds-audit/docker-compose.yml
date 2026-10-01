@@ -39,6 +39,10 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Shutdown writes the windows still in progress; that can take up to a
+    # minute while the last getBlock checks finish. Docker's default 10s would
+    # SIGKILL it and lose them.
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy

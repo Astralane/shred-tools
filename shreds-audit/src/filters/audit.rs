@@ -16,6 +16,13 @@ const END_MARGIN: u64 = 3;
 const VIOLATIONS_PER_KIND: u32 = 25;
 const SERVER_DELAY_RESERVOIR: usize = 50_000;
 const START_WITHOUT_DELIVERY_SLOTS: u64 = 10;
+/// A window's legitimate range is a minute or so of slots. A cursor further
+/// behind the tip than this means its start was wrong, and walking it forward
+/// would mean a getBlock for every sampled slot of chain history in between.
+const MAX_CURSOR_LAG_SLOTS: u64 = 600;
+/// Slots handed out per window per tick, so one window can never monopolise the
+/// checker.
+const MAX_TASKS_PER_WINDOW: usize = 32;
 
 fn commitment_lag(kind: SourceKind, commitment: Option<&str>) -> u64 {
     if kind == SourceKind::GrpcDeshred {
@@ -65,6 +72,11 @@ pub struct Window {
     pub connect_ms: Option<f64>,
     pub first_msg_ms: Option<f64>,
     pub tip_open: Option<u64>,
+    /// The subscription is live. `tip_open` can still be `None` after this when
+    /// it went live before any slot was seen (startup): it is then filled from
+    /// the first real tip or delivery, which is later than the subscription and
+    /// so on the safe side.
+    pub subscribed: bool,
     pub tip_close: Option<u64>,
     pub ended_at: Option<SystemTime>,
     pub end_reason: Option<String>,
@@ -107,6 +119,7 @@ impl Window {
             connect_ms: None,
             first_msg_ms: None,
             tip_open: None,
+            subscribed: false,
             tip_close: None,
             ended_at: None,
             end_reason: None,
@@ -239,7 +252,10 @@ impl FilterAudit {
     pub fn subscribed(&self, key: WindowKey) {
         let tip = self.tip();
         if let Some(w) = self.state.lock().unwrap().get_mut(&key) {
-            w.tip_open = Some(tip);
+            // Tip 0 is "no slot seen yet", not slot 0: starting the audited range
+            // there would walk the checker through the whole chain history.
+            w.tip_open = (tip > 0).then_some(tip);
+            w.subscribed = true;
             w.connect_ms = Some(w.opened.elapsed().as_secs_f64() * 1000.0);
         }
     }
@@ -279,6 +295,9 @@ impl FilterAudit {
 
         w.delivered += 1;
         w.first_delivered_slot.get_or_insert(slot);
+        if w.subscribed && w.tip_open.is_none() && slot > 0 {
+            w.tip_open = Some(slot);
+        }
         w.max_delivered_slot = w.max_delivered_slot.max(slot);
         if let Some(c) = created_ns {
             w.server_delay_us.push((rx_ns - c) / 1000);
@@ -361,6 +380,9 @@ impl FilterAudit {
         let mut out = Vec::new();
         let mut state = self.state.lock().unwrap();
         for w in state.values_mut() {
+            if w.subscribed && w.tip_open.is_none() && tip > 0 {
+                w.tip_open = Some(tip);
+            }
             if w.next_check.is_none() && !w.start_known(tip) {
                 continue;
             }
@@ -369,7 +391,16 @@ impl FilterAudit {
             };
             let end = w.end_slot(tip);
             let next = w.next_check.get_or_insert(start.div_ceil(n) * n);
-            while *next <= end && *next + lag_slots <= tip {
+            let floor = tip.saturating_sub(lag_slots + MAX_CURSOR_LAG_SLOTS);
+            if *next < floor {
+                let jumped = floor.div_ceil(n) * n;
+                // Never silent: these sampled slots go on record as unchecked.
+                w.slots_unchecked += (jumped - *next) / n;
+                *next = jumped;
+            }
+            let mut handed = 0;
+            while *next <= end && *next + lag_slots <= tip && handed < MAX_TASKS_PER_WINDOW {
+                handed += 1;
                 let slot = *next;
                 *next += n;
                 out.push(SlotTask {
@@ -526,7 +557,7 @@ mod tests {
         audit.on_delivery(key, 1020, &user_tx(1), &["all".into()], None, 0, None);
         bump(&reg, 1021);
         audit.close(key, "rotated".into());
-        bump(&reg, 2000);
+        bump(&reg, 1060);
         let slots: Vec<u64> = audit.take_ready(32).iter().map(|t| t.slot).collect();
         assert_eq!(slots, vec![1010]);
     }
@@ -568,6 +599,37 @@ mod tests {
             Some(&1010),
             "nothing delivered is itself checked"
         );
+    }
+
+    #[test]
+    fn subscribing_before_any_slot_is_seen_never_starts_at_slot_zero() {
+        let reg = Arc::new(Mutex::new(SigRegistry::new(
+            vec!["s".into(), "g".into()],
+            vec![SourceKind::Shred, SourceKind::GrpcDeshred],
+        )));
+        let audit = FilterAudit::new(10, false, reg.clone());
+        let key = (1, 0);
+        audit.open(key, info(bundle("combo_never")));
+        audit.subscribed(key); // startup: no shred yet, tip is 0
+        bump(&reg, 452_000_000);
+        assert!(audit.take_ready(32).is_empty(), "tip just learned; start not settled yet");
+        bump(&reg, 452_000_100);
+        let slots: Vec<u64> = audit.take_ready(32).iter().map(|t| t.slot).collect();
+        assert!(!slots.is_empty());
+        assert!(slots.iter().all(|&s| s >= 452_000_000), "{slots:?}");
+    }
+
+    #[test]
+    fn a_cursor_far_behind_the_tip_jumps_instead_of_walking_history() {
+        let reg = reg_at(1000);
+        let audit = FilterAudit::new(10, false, reg.clone());
+        let key = (1, 0);
+        audit.open(key, info(bundle("combo_never")));
+        audit.subscribed(key);
+        bump(&reg, 5_000_000);
+        let ready = audit.take_ready(32);
+        assert!(ready.len() <= MAX_TASKS_PER_WINDOW);
+        assert!(ready[0].slot >= 5_000_000 - 32 - MAX_CURSOR_LAG_SLOTS);
     }
 
     #[test]
