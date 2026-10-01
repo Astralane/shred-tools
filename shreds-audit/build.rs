@@ -1,31 +1,31 @@
-//! Compile the Yellowstone/Geyser gRPC protobufs into Rust at build time.
-//!
-//! Only needed for the optional shred-vs-gRPC transaction-timing comparison. The
-//! protoc binary is vendored so the build does not depend on a system install.
+use std::process::Command;
 
-use std::{env, path::PathBuf};
+fn main() {
+    println!("cargo:rustc-env=GIT_COMMIT={}", git_commit());
 
-const PROTO_ROOT: &str = "proto";
-const PROTO_FILES: &[&str] = &["proto/geyser.proto", "proto/solana-storage.proto"];
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=proto");
-
-    let protoc = protoc_bin_vendored::protoc_bin_path()?;
-    let include_path = protoc_bin_vendored::include_path()?;
-    // Some prost/tonic build paths still read PROTOC from the environment.
-    unsafe {
-        env::set_var("PROTOC", &protoc);
-        env::set_var("PROTOC_INCLUDE", &include_path);
+    if let Some(git_dir) = run_git(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        if let Some(head_ref) = run_git(&["symbolic-ref", "--quiet", "HEAD"]) {
+            println!("cargo:rerun-if-changed={git_dir}/{head_ref}");
+            println!("cargo:rerun-if-changed={git_dir}/packed-refs");
+        }
     }
+}
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let include_dir = include_path.to_string_lossy().into_owned();
-    let includes = [PROTO_ROOT, include_dir.as_str()];
+fn git_commit() -> String {
+    let Some(hash) = run_git(&["rev-parse", "--short", "HEAD"]) else {
+        return "unknown".to_string();
+    };
+    match run_git(&["status", "--porcelain"]) {
+        Some(s) if !s.is_empty() => format!("{hash}-dirty"),
+        _ => hash,
+    }
+}
 
-    tonic_prost_build::configure()
-        .build_server(false)
-        .file_descriptor_set_path(out_dir.join("proto_descriptors.bin"))
-        .compile_protos(PROTO_FILES, &includes)?;
-    Ok(())
+fn run_git(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
 }

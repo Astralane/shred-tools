@@ -1,21 +1,3 @@
-//! Example shred-triggered tip bench client.
-//!
-//! Subscribes to the raw shred stream forwarded by shreds-hub (plain UDP, one
-//! serialized Solana shred per datagram), deshreds + decodes each slot into
-//! transactions, and watches for any transaction that touches a configurable
-//! "trigger" wallet (`--watch-wallet`). The moment one is seen it:
-//!   1. builds a simple SOL transfer that tips an Astralane tip account,
-//!   2. submits it to iris (`sendTransaction`) as fast as possible,
-//!   3. registers it via the `/shred-pay` endpoint and prints when accepted,
-//!   4. waits for it to land and logs the slot distance between the trigger
-//!      transaction and our landed transaction.
-//!
-//! Runs until Ctrl-C.
-//!
-//! NOTE: for this client to receive anything, shreds-hub must be forwarding
-//! shreds to this host:`--shred-port` (its listener set, via the DB or a
-//! `named_listeners` config entry).
-
 mod config;
 mod decode;
 mod receiver;
@@ -37,8 +19,8 @@ use solana_sdk::signature::{EncodableKey, Keypair};
 use tokio::sync::{mpsc, RwLock};
 
 use config::Args;
-use decode::{ingest_shred, SlotState};
-use receiver::{run_receiver, ShredPacket};
+use decode::ingest_shred;
+use receiver::run_receiver;
 use trigger::{handle_trigger, Shared};
 
 #[tokio::main]
@@ -55,37 +37,31 @@ async fn main() -> anyhow::Result<()> {
         .tip_address
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid --tip-address pubkey: {}", args.tip_address))?;
-    let keypair = Arc::new(
-        Keypair::read_from_file(&args.keypair_path)
-            .map_err(|e| anyhow::anyhow!("failed to read keypair: {e}"))?,
-    );
+    let keypair = Keypair::read_from_file(&args.keypair_path)
+        .map_err(|e| anyhow::anyhow!("failed to read keypair: {e}"))?;
 
-    let rpc = Arc::new(RpcClient::new_with_commitment(
-        args.rpc_url.clone(),
-        CommitmentConfig::confirmed(),
-    ));
-
-    // Prime the blockhash cache up front so the first trigger is instant.
-    let initial_blockhash = rpc.get_latest_blockhash().await?;
-    let blockhash = Arc::new(RwLock::new(initial_blockhash));
+    let rpc = RpcClient::new_with_commitment(args.rpc_url.clone(), CommitmentConfig::confirmed());
+    // Fetch up front so the first trigger doesn't wait on RPC.
+    let blockhash = RwLock::new(rpc.get_latest_blockhash().await?);
 
     info!(
         "shreds-example started | watch={} | tip {} lamports -> {} | shred udp :{} | iris={} | shred-pay={}",
         watch_wallet, args.tip_lamports, tip_to, args.shred_port, args.iris_url, args.shred_pay_url
     );
 
+    let shred_port = args.shred_port;
+    let ttl = Duration::from_secs(args.slot_ttl_secs);
     let shared = Arc::new(Shared {
-        args: args.clone(),
+        args,
         keypair,
         tip_to,
         http: Client::new(),
-        rpc: rpc.clone(),
-        blockhash: blockhash.clone(),
+        rpc,
+        blockhash,
     });
 
     let running = Arc::new(AtomicBool::new(true));
 
-    // Ctrl-C -> stop.
     {
         let running = running.clone();
         tokio::spawn(async move {
@@ -95,53 +71,45 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Background blockhash refresher.
     {
-        let rpc = rpc.clone();
-        let blockhash = blockhash.clone();
+        let shared = shared.clone();
         let running = running.clone();
         tokio::spawn(async move {
             while running.load(Ordering::SeqCst) {
-                if let Ok(bh) = rpc.get_latest_blockhash().await {
-                    *blockhash.write().await = bh;
+                if let Ok(bh) = shared.rpc.get_latest_blockhash().await {
+                    *shared.blockhash.write().await = bh;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
 
-    // UDP receiver runs on a dedicated blocking thread and feeds the processor.
-    let (tx, mut rx) = mpsc::unbounded_channel::<ShredPacket>();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let recv_handle = {
         let running = running.clone();
-        let port = args.shred_port;
-        std::thread::spawn(move || run_receiver(port, tx, running))
+        std::thread::spawn(move || run_receiver(shred_port, tx, running))
     };
 
-    // Processor: decode shreds, detect triggers, spawn a handler per new trigger.
-    let mut slots: HashMap<u64, SlotState> = HashMap::new();
-    let mut seen_triggers: HashSet<String> = HashSet::new();
+    let mut slots = HashMap::new();
+    let mut seen_triggers = HashSet::new();
     let mut last_prune = Instant::now();
     let mut last_sent = Instant::now();
-    let ttl = Duration::from_secs(args.slot_ttl_secs);
 
     while running.load(Ordering::SeqCst) {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(packet)) => {
                 for (trigger_slot, trigger_sig) in
-                    ingest_shred(&mut slots, &packet, &watch_wallet, &mut seen_triggers)
+                    ingest_shred(&mut slots, packet, &watch_wallet, &mut seen_triggers)
                 {
+                    // At most one tip tx per second.
                     if last_sent.elapsed() >= Duration::from_secs(1) {
                         last_sent = Instant::now();
-                        let shared = shared.clone();
-                        tokio::spawn(async move {
-                            handle_trigger(shared, trigger_slot, trigger_sig).await;
-                        });
+                        tokio::spawn(handle_trigger(shared.clone(), trigger_slot, trigger_sig));
                     }
                 }
             }
-            Ok(None) => break, // receiver thread gone
-            Err(_) => {}       // idle tick
+            Ok(None) => break,
+            Err(_) => {}
         }
 
         if last_prune.elapsed() >= Duration::from_secs(2) {
@@ -154,7 +122,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    running.store(false, Ordering::SeqCst);
     let _ = recv_handle.join();
     info!("shreds-example stopped");
     Ok(())

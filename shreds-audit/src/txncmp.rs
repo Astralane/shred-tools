@@ -1,69 +1,79 @@
-//! Orchestration for the shred-vs-gRPC transaction-timing comparison.
-//!
-//! Wires three pieces around a shared [`SigRegistry`]:
-//!   * a deshred worker thread reconstructing transactions from the shred stream,
-//!   * a Tokio runtime on its own thread running every configured gRPC source,
-//!   * a summary printed at shutdown.
-//!
-//! Created only when the config declares `grpc_sources`.
-
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
 
+use bytes::Bytes;
 use crossbeam_channel::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, GrpcMode};
-use crate::deshred::{is_data_shred_variant, Deshredder, ShredInput};
-use crate::sigreg::{SigRegistry, SourceKind};
+use crate::config::{Config, GrpcMode, GrpcSourceCfg};
+use crate::deshred::{Deshredder, ShredInput};
+use crate::filters::{
+    audit::{FilterAudit, WindowInfo},
+    bundles::Bundle,
+    FilterAuditor, Rotation,
+};
+use crate::grpc::{run_source, Subscription};
+use crate::out::{TxnCompareSummary, TxnSource};
+use crate::sigreg::{SigRegistry, SourceKind, TxnRow};
 use crate::verification::onchain_signatures::{OnchainAudit, OnchainVerifier};
-
-/// Offset of the shred variant byte within a shred payload. Matches `verify.rs`.
-const VARIANT_OFFSET: usize = 64;
 
 pub struct TxnCompare {
     reg: Arc<Mutex<SigRegistry>>,
-    feed: Sender<ShredInput>,
+    feed: Option<Sender<ShredInput>>,
     deshred_handle: Option<JoinHandle<()>>,
-    grpc_handle: Option<JoinHandle<()>>,
-    /// Onchain signature audit, when enabled. `None` leaves every `onchain_*`
-    /// field zero rather than inventing a verdict from an audit that never ran.
+    async_handle: Option<JoinHandle<()>>,
     onchain: Option<OnchainVerifier>,
     cancel: CancellationToken,
+    labels: Vec<(String, SourceKind)>,
+    filter_audit: Option<FilterAuditor>,
 }
 
 impl TxnCompare {
-    /// Spin up the comparison subsystem. Returns `None` when no gRPC sources are
-    /// configured, so callers can treat "off" as the common case.
-    pub fn start(cfg: &Config) -> Option<Self> {
+    /// Returns `None` when no gRPC sources are configured.
+    pub fn start(
+        cfg: &Config,
+        dump_txns: bool,
+        filter_db: Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         if cfg.grpc_sources.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        // Each shred provider is its own source (source id = provider id); gRPC
-        // feeds follow. Both race each transaction as peers.
-        let mut names: Vec<String> = cfg.providers.iter().map(|p| p.name.clone()).collect();
-        let mut kinds: Vec<SourceKind> = vec![SourceKind::Shred; cfg.providers.len()];
+        // Source ids: shred providers first (sid = provider id), then gRPC sources.
         let n_providers = cfg.providers.len();
-        for g in &cfg.grpc_sources {
-            names.push(g.name.clone());
-            kinds.push(SourceKind::Grpc);
+        let labels: Vec<(String, SourceKind)> = cfg
+            .providers
+            .iter()
+            .map(|p| (p.name.clone(), SourceKind::Shred))
+            .chain(
+                cfg.grpc_sources
+                    .iter()
+                    .map(|g| (g.name.clone(), SourceKind::from(g.mode))),
+            )
+            .collect();
+        let n_sources = labels.len();
+        let (names, kinds) = labels.iter().cloned().unzip();
+        let mut reg = SigRegistry::new(names, kinds);
+        if dump_txns {
+            reg.enable_txn_rows();
         }
-        let n_sources = names.len();
-        let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
+        for (i, g) in cfg.grpc_sources.iter().enumerate() {
+            if cfg.rotating(g) {
+                reg.set_rotating(n_providers + i);
+            }
+        }
+        let reg = Arc::new(Mutex::new(reg));
         let cancel = CancellationToken::new();
+        let filter_audit = FilterAuditor::start(cfg, reg.clone(), filter_db)?;
 
-        // Started before anything can record, so the audit's per-slot index is
-        // live from the first delivery rather than missing the opening slots.
+        // Started before anything records, so the onchain index sees the opening slots.
+        let onchain_rpc = cfg.onchain_rpc_endpoint()?;
         let onchain = cfg.onchain_verify.then(|| {
             OnchainVerifier::start(
-                cfg.effective_onchain_rpc_url().to_string(),
+                onchain_rpc.clone(),
                 cfg.onchain_lag_slots,
                 cfg.onchain_sample_secs,
                 n_sources,
@@ -72,23 +82,34 @@ impl TxnCompare {
             )
         });
 
-        // Deshred worker. Bounded so a stall drops feed rather than growing without
-        // limit; the comparison is best-effort and must never become the backlog.
-        let (feed, feed_rx) = crossbeam_channel::bounded::<ShredInput>(65_536);
-        let settle = Duration::from_secs(cfg.txn_settle_secs.max(1));
-        let deshredder = Deshredder::new(reg.clone(), settle);
+        // Bounded: a stalled deshredder drops feed instead of growing a backlog.
+        let (feed, feed_rx) = crossbeam_channel::bounded::<ShredInput>(131_072);
+        let deshredder = Deshredder::new(reg.clone());
         let deshred_handle = std::thread::Builder::new()
             .name("deshred".into())
             .spawn(move || deshredder.run(feed_rx))
             .ok();
 
-        // gRPC runtime thread. gRPC source ids start after the shred providers.
-        let grpc_sources = cfg.grpc_sources.clone();
-        let grpc_reg = reg.clone();
-        let grpc_cancel = cancel.clone();
-        let grpc_handle = std::thread::Builder::new()
-            .name("grpc".into())
-            .spawn(move || run_grpc_runtime(grpc_sources, grpc_reg, grpc_cancel, n_providers))
+        let sources: Vec<SourcePlan> = cfg
+            .grpc_sources
+            .iter()
+            .enumerate()
+            .map(|(i, g)| SourcePlan {
+                sid: n_providers + i,
+                cfg: g.clone(),
+                rotation: filter_audit.as_ref().filter(|_| cfg.rotating(g)).map(|fa| {
+                    (
+                        fa.audit.clone(),
+                        FilterAuditor::rotation(cfg, g.mode, (n_providers + i) as u64 + 1),
+                    )
+                }),
+            })
+            .collect();
+        let async_reg = reg.clone();
+        let async_cancel = cancel.clone();
+        let async_handle = std::thread::Builder::new()
+            .name("txn-async-sources".into())
+            .spawn(move || run_async_runtime(sources, async_reg, async_cancel))
             .ok();
 
         let transaction_sources = cfg
@@ -98,41 +119,52 @@ impl TxnCompare {
             .count();
         let deshred_sources = cfg.grpc_sources.len() - transaction_sources;
         eprintln!(
-            "txn-compare: reconstructing transactions per shred provider and subscribing to {} \
-             transaction + {} deshred gRPC source(s); racing every source by transaction signature",
+            "txn-compare: reconstructing transactions per shred provider (with Reed-Solomon \
+             recovery) and subscribing to {} transaction + {} deshred gRPC source(s); racing \
+             every source by transaction signature",
             transaction_sources, deshred_sources
         );
         if onchain.is_some() {
             eprintln!(
                 "txn-compare: auditing every source against the chain — sampling one slot every \
-                 {}s at {} slots behind the tip via getBlock on {}",
+                 {}s at {} slots behind the tip via getBlock on {}{}",
                 cfg.onchain_sample_secs,
                 cfg.onchain_lag_slots,
-                cfg.effective_onchain_rpc_url()
+                onchain_rpc.label(),
+                if onchain_rpc.omits_votes() {
+                    " (votes excluded: this RPC leaves them out of getBlock)"
+                } else {
+                    ""
+                }
             );
         }
 
-        Some(Self {
+        Ok(Some(Self {
             reg,
-            feed,
+            feed: Some(feed),
             deshred_handle,
-            grpc_handle,
+            async_handle,
             onchain,
             cancel,
-        })
+            labels,
+            filter_audit,
+        }))
     }
 
-    /// Current comparison as a structured snapshot — fed to the TUI live and
-    /// embedded in the archive manifest for the result page and web viewer.
-    /// Retires signatures that have settled, keeping the registry bounded.
-    pub fn snapshot(&self) -> crate::out::TxnCompareSummary {
+    pub fn harvest(&self) -> Vec<TxnRow> {
+        self.reg.lock().unwrap().drain_rows()
+    }
+
+    pub fn labels(&self) -> &[(String, SourceKind)] {
+        &self.labels
+    }
+
+    pub fn snapshot(&self) -> TxnCompareSummary {
         build_snapshot(&self.reg, self.onchain_audit(), false)
     }
 
-    /// Like [`snapshot`](Self::snapshot) but finalizes every in-flight signature,
-    /// so the last archive reflects the whole run rather than dropping the tail
-    /// still within the eviction margin.
-    pub fn final_snapshot(&self) -> crate::out::TxnCompareSummary {
+    /// Finalizes every in-flight signature, including those still inside the eviction margin.
+    pub fn final_snapshot(&self) -> TxnCompareSummary {
         build_snapshot(&self.reg, self.onchain_audit(), true)
     }
 
@@ -140,109 +172,65 @@ impl TxnCompare {
         self.onchain.as_ref().map(|v| v.snapshot())
     }
 
-    /// Tee a received datagram into the deshred feed if it looks like a data shred.
-    /// Cheap: one byte is inspected before any clone, so coding shreds, pings, and
-    /// non-shred traffic never allocate. Silently drops when the feed is full.
     pub fn feed(&self, rx_unix_ns: i64, provider: u16, data: &[u8]) {
-        if data.len() <= VARIANT_OFFSET {
-            return;
+        if let Some(feed) = &self.feed {
+            let _ = feed.try_send(ShredInput {
+                rx_unix_ns,
+                provider,
+                data: Bytes::copy_from_slice(data),
+            });
         }
-        if !is_data_shred_variant(data[VARIANT_OFFSET]) {
-            return;
-        }
-        let _ = self.feed.try_send(ShredInput {
-            rx_unix_ns,
-            provider,
-            data: data.to_vec(),
-        });
     }
 
-    /// Stop the subsystem, join its threads, and print the timing summary.
-    pub fn finish(self) {
-        let TxnCompare {
-            reg,
-            feed,
-            mut deshred_handle,
-            mut grpc_handle,
-            onchain,
-            cancel,
-        } = self;
-        // Dropping the sender lets the deshred worker drain and exit; cancel stops
-        // the gRPC runtime and the onchain sampler.
-        cancel.cancel();
-        drop(feed);
-        if let Some(h) = deshred_handle.take() {
+    pub fn shutdown(&mut self) {
+        self.cancel.cancel();
+        drop(self.feed.take());
+        if let Some(h) = self.deshred_handle.take() {
             let _ = h.join();
         }
-        if let Some(h) = grpc_handle.take() {
+        if let Some(h) = self.async_handle.take() {
             let _ = h.join();
         }
-        // Read the audit before joining: the totals are what we report, and the
-        // worker only ever adds to them.
-        let audit = onchain.as_ref().map(|v| v.snapshot());
-        if let Some(v) = onchain {
+        if let Some(fa) = self.filter_audit.take() {
+            fa.finish();
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.shutdown();
+        let audit = self.onchain.take().map(|v| {
+            let audit = v.snapshot();
             v.finish();
-        }
-        report(&reg, audit);
+            audit
+        });
+        report(&self.reg, audit);
     }
 }
 
-/// Build a structured snapshot from the shared registry; every source becomes a
-/// peer row. The registry lock is held only long enough to finalize settled rows
-/// and copy each source's raw totals — the per-source percentile sort runs after
-/// the lock is released, off the hot `record_first` path.
 fn build_snapshot(
     reg: &Mutex<SigRegistry>,
     audit: Option<OnchainAudit>,
     force: bool,
-) -> crate::out::TxnCompareSummary {
-    use crate::out::{TxnCompareSummary, TxnSource};
-    use crate::sigreg::{percentiles_us, SourceKind};
-
-    struct Row {
-        name: String,
-        kind: SourceKind,
-        raw: crate::sigreg::SourceRaw,
-    }
-
-    let (rows, distinct, contested) = {
-        let mut reg = reg.lock().unwrap();
-        reg.finalize(force);
-        let raw = reg.export();
-        let rows: Vec<Row> = raw
-            .into_iter()
-            .enumerate()
-            .map(|(sid, raw)| Row {
-                name: reg.name(sid).to_string(),
-                kind: reg.kind(sid),
-                raw,
-            })
-            .collect();
-        (rows, reg.distinct_signatures(), reg.contested_signatures())
-    };
-
-    let sources = rows
+) -> TxnCompareSummary {
+    let audit = audit.unwrap_or_default();
+    let mut reg = reg.lock().unwrap();
+    reg.finalize(force);
+    let sources = reg
+        .export()
         .into_iter()
         .enumerate()
-        .map(|(sid, mut r)| {
-            let pct = percentiles_us(&mut r.raw.behind_ns);
-            let oc = audit
-                .as_ref()
-                .and_then(|a| a.sources.get(sid).copied())
-                .unwrap_or_default();
+        .map(|(sid, raw)| {
+            let oc = audit.sources.get(sid).copied().unwrap_or_default();
             TxnSource {
-                name: r.name,
-                kind: match r.kind {
-                    SourceKind::Shred => "shreds".into(),
-                    SourceKind::Grpc => "grpc".into(),
-                },
-                seen: r.raw.seen,
-                contested: r.raw.contested,
-                winrate: (r.raw.contested > 0).then(|| r.raw.wins as f64 / r.raw.contested as f64),
-                behind_mean_us: r.raw.mean_us,
-                behind_p50_us: pct.p50,
-                behind_p90_us: pct.p90,
-                behind_p99_us: pct.p99,
+                name: reg.name(sid).to_string(),
+                kind: reg.kind(sid),
+                seen: raw.seen,
+                contested: raw.contested,
+                winrate: (raw.contested > 0).then(|| raw.wins as f64 / raw.contested as f64),
+                behind_mean_us: raw.mean_us,
+                behind_p50_us: raw.p50_us,
+                behind_p90_us: raw.p90_us,
+                behind_p99_us: raw.p99_us,
                 onchain_slots_checked: oc.slots_checked,
                 onchain_slots_absent: oc.slots_absent,
                 onchain_txns: oc.onchain_txns,
@@ -255,18 +243,16 @@ fn build_snapshot(
         })
         .collect();
     TxnCompareSummary {
-        distinct_signatures: distinct,
-        contested,
+        distinct_signatures: reg.distinct_signatures(),
+        contested: reg.contested_signatures(),
         sources,
-        onchain_slots_checked: audit.as_ref().map(|a| a.slots_checked).unwrap_or(0),
-        onchain_slots_unavailable: audit.as_ref().map(|a| a.slots_unavailable).unwrap_or(0),
-        onchain_rpc_errors: audit.as_ref().map(|a| a.rpc_errors).unwrap_or(0),
-        onchain_last_error: audit.and_then(|a| a.last_error),
+        onchain_slots_checked: audit.slots_checked,
+        onchain_slots_unavailable: audit.slots_unavailable,
+        onchain_rpc_errors: audit.rpc_errors,
+        onchain_last_error: audit.last_error,
     }
 }
 
-/// One-line-per-source summary to stderr at shutdown (logs only; the real output
-/// is the snapshot embedded in the manifest).
 fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>) {
     let snap = build_snapshot(reg, audit, true);
     eprintln!(
@@ -316,13 +302,16 @@ fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>) {
     }
 }
 
-/// Run every gRPC source on a dedicated multi-thread runtime, each supervised with
-/// a reconnect loop, until cancellation.
-fn run_grpc_runtime(
-    sources: Vec<crate::config::GrpcSourceCfg>,
+struct SourcePlan {
+    sid: usize,
+    cfg: GrpcSourceCfg,
+    rotation: Option<(Arc<FilterAudit>, Rotation)>,
+}
+
+fn run_async_runtime(
+    sources: Vec<SourcePlan>,
     reg: Arc<Mutex<SigRegistry>>,
     cancel: CancellationToken,
-    sid_base: usize,
 ) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -338,42 +327,115 @@ fn run_grpc_runtime(
 
     rt.block_on(async move {
         let mut set = tokio::task::JoinSet::new();
-        for (i, src) in sources.into_iter().enumerate() {
-            let sid = sid_base + i; // gRPC ids follow the shred providers
-            let reg = reg.clone();
-            let cancel = cancel.clone();
-            set.spawn(async move {
-                supervise_source(sid, src, reg, cancel).await;
-            });
+        for plan in sources {
+            set.spawn(supervise_grpc_source(plan, reg.clone(), cancel.clone()));
         }
         while set.join_next().await.is_some() {}
     });
 }
 
-/// Keep one source connected across errors until cancelled.
-async fn supervise_source(
-    sid: usize,
-    cfg: crate::config::GrpcSourceCfg,
+async fn supervise_grpc_source(
+    plan: SourcePlan,
     reg: Arc<Mutex<SigRegistry>>,
     cancel: CancellationToken,
 ) {
-    // Latch so the first connection failure is loud but reconnect churn is not.
-    let announced = AtomicBool::new(false);
+    let SourcePlan {
+        sid,
+        cfg,
+        mut rotation,
+    } = plan;
+    // Only the first failure is logged, so reconnect churn stays quiet.
+    let mut announced = false;
+    let mut connection_id: u32 = 0;
     while !cancel.is_cancelled() {
-        match crate::grpc::run_source(sid, cfg.clone(), reg.clone(), cancel.clone()).await {
-            Ok(()) => {}
-            Err(e) => {
-                if !announced.swap(true, Ordering::Relaxed) {
-                    eprintln!("txn-compare: gRPC source `{}` error: {e:#}", cfg.name);
+        let sub = match rotation.as_mut() {
+            Some((audit, rotation)) => {
+                let (bundle, dur) = rotation.next();
+                let key = (sid, connection_id);
+                audit.open(
+                    key,
+                    WindowInfo {
+                        source: cfg.name.clone(),
+                        kind: SourceKind::from(cfg.mode),
+                        commitment: match cfg.mode {
+                            GrpcMode::Transactions => Some(cfg.effective_commitment().to_string()),
+                            GrpcMode::Deshred => None,
+                        },
+                        bundle: bundle.clone(),
+                    },
+                );
+                Subscription {
+                    bundle,
+                    window: Some((audit.clone(), key)),
+                    deadline: Some(tokio::time::Instant::now() + dur),
                 }
             }
+            None => Subscription {
+                bundle: Bundle::all(),
+                window: None,
+                deadline: None,
+            },
+        };
+        let window = sub.window.clone();
+        let result = run_source(sid, cfg.clone(), sub, reg.clone(), cancel.clone(), connection_id).await;
+        if let Some((audit, key)) = window {
+            let reason = match &result {
+                Ok(end) => end.label().to_string(),
+                Err(e) => format!("error: {e:#}"),
+            };
+            audit.close(key, reason);
         }
+        let failed = result.is_err();
+        if let Err(e) = result {
+            if !announced {
+                announced = true;
+                eprintln!("txn-compare: gRPC source `{}` error: {e:#}", cfg.name);
+            }
+        }
+        connection_id += 1;
         if cancel.is_cancelled() {
             break;
         }
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        if failed || rotation.is_none() {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_labels_every_source_kind_distinctly() {
+        let names = vec!["s1".into(), "g1".into(), "d1".into()];
+        let kinds = vec![SourceKind::Shred, SourceKind::Grpc, SourceKind::GrpcDeshred];
+        let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
+
+        let snap = build_snapshot(&reg, None, false);
+        assert_eq!(snap.sources.len(), 3);
+        assert_eq!(snap.sources[0].kind, SourceKind::Shred);
+        assert_eq!(snap.sources[1].kind, SourceKind::Grpc);
+        assert_eq!(snap.sources[2].kind, SourceKind::GrpcDeshred);
+    }
+
+    #[test]
+    fn source_kind_serializes_to_its_label() {
+        let names = vec!["s1".into(), "g1".into(), "d1".into()];
+        let kinds = vec![SourceKind::Shred, SourceKind::Grpc, SourceKind::GrpcDeshred];
+        let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
+
+        let snap = build_snapshot(&reg, None, false);
+        let json = serde_json::to_value(&snap).unwrap();
+        let kinds: Vec<&str> = json["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["shreds", "grpc", "grpc-deshred"]);
     }
 }

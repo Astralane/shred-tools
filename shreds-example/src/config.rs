@@ -1,8 +1,6 @@
-//! Command-line arguments.
-
 use clap::Parser;
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug)]
 #[command(about = "Shred-triggered tip bench: watch a wallet in shreds, race a tip tx to iris")]
 pub struct Args {
     /// UDP port to bind for receiving raw shreds forwarded by shreds-hub.

@@ -1,15 +1,12 @@
 [package]
 name = "shred-audit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Receive Solana shreds from multiple providers, verify every shred's signature against the slot leader, timestamp arrival with nanosecond precision, and emit a signed Parquet report."
 
 [dependencies]
-# Shred wire-format parsing.
-solana-ledger = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
-    "agave-unstable-api",
-] }
+solana-ledger = { git = "https://github.com/nuel77/agave", branch = "feat/v4.3.0-shred-recover", features = ["agave-unstable-api"] }
 solana-sdk = "3.0.0"
 
 ed25519-dalek = { version = "2", features = ["batch"] }
@@ -27,32 +24,24 @@ ureq = { version = "2", features = ["json"] }
 bs58 = "0.5"
 ctrlc = "3"
 chrono = "0.4"
+hdrhistogram = "7.5"
 
-# Live TUI dashboard (opt-in via --tui). ratatui re-exports crossterm, so the
-# terminal backend rides along with it — no separate crossterm pin to drift.
+# Re-exports crossterm; no separate pin to drift.
 ratatui = "0.29"
+
+postgres = "0.19"
 
 zip = { version = "2", default-features = false, features = ["deflate"] }
 parquet = { version = "55", features = ["arrow", "zstd"] }
 arrow-array = "55"
 arrow-schema = "55"
 
-# Optional shred-vs-gRPC transaction-timing comparison. The shred stream is
-# reconstructed into transactions with the same agave fork used for shred parsing,
-# and a Geyser/Yellowstone gRPC feed is subscribed for the same transactions; the
-# two are matched by transaction signature. All of this is inert unless the config
-# declares one or more `grpc_sources`.
-solana-entry = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
-    "agave-unstable-api",
-] }
-wincode = "0.2.5"
+deshred = { path = "../deshred" }
 
-# Async runtime for the gRPC subscription (the rest of the tool stays synchronous;
-# the runtime lives on its own thread).
 tokio = { version = "1.40", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 
-# Geyser gRPC client (yellowstone-grpc compatible).
+shreds-proto = { path = "../proto" }
 tonic = { version = "~0.14.2", features = ["tls-native-roots"] }
 tonic-prost = "~0.14.0"
 prost = "0.14"
@@ -61,22 +50,20 @@ bytes = "1"
 futures = "0.3"
 
 [dev-dependencies]
-# Real shred construction for the signature-path integration test. Same fork
-# pin as the runtime dep so the wire format is identical.
-solana-ledger = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
+# Same fork pin as the runtime dep so the test shreds' wire format is identical.
+solana-ledger = { git = "https://github.com/nuel77/agave", branch = "feat/v4.3.0-shred-recover", features = [
     "agave-unstable-api",
     "dev-context-only-utils",
 ] }
-solana-entry = { git = "https://github.com/nuel77/agave", branch = "xdp-read-dev", features = [
-    "agave-unstable-api",
-] }
-
-[build-dependencies]
-tonic-prost-build = "~0.14.0"
-protoc-bin-vendored = "3"
+solana-entry = { git = "https://github.com/nuel77/agave", branch = "feat/v4.3.0-shred-recover", features = ["agave-unstable-api"] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[patch.crates-io]
+crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "5ee1c6ec671d94db14ed9238eb99e59a84555aad" }
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }

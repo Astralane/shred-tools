@@ -1,12 +1,5 @@
-//! Validator display names, resolved once at capture and embedded in the
-//! manifest so the offline viewer never touches the network. Best-effort: any
-//! failure just means the viewer shows pubkeys.
-//!
-//! The authoritative source is on-chain validator-info (getProgramAccounts on
-//! the Config program), but that call is unavailable on every RPC we can reach —
-//! public RPCs disable it and an un-indexed validator times out on the full-DB
-//! scan. Names are only a cosmetic label, so we take them from the public
-//! Firedancer daily validator report (identity pubkey -> name).
+//! Validator display names from the Firedancer daily report. On-chain
+//! validator-info needs getProgramAccounts, which no reachable RPC serves.
 
 use std::time::Duration;
 
@@ -17,7 +10,6 @@ use solana_sdk::pubkey::Pubkey;
 const REPORT_URL: &str = "https://reports.firedancer.io/api/export";
 const LOOKBACK_DAYS: i64 = 7;
 
-/// Fetch `identity pubkey -> display name` from the Firedancer validator report.
 /// Today's report may not exist yet, so walk back until a day is available.
 pub fn fetch_validator_names() -> Result<AHashMap<Pubkey, String>> {
     let today = chrono::Utc::now().date_naive();
@@ -40,7 +32,6 @@ pub fn fetch_validator_names() -> Result<AHashMap<Pubkey, String>> {
                     return Ok(map);
                 }
             }
-            // No report published for that day yet — try an earlier one.
             Err(ureq::Error::Status(404, _)) => {}
             Err(e) => last_err = Some(anyhow!("{e}")),
         }
@@ -80,8 +71,7 @@ fn parse_report(csv: &str) -> AHashMap<Pubkey, String> {
     out
 }
 
-/// Split one CSV line into fields, honouring double-quoted fields (which may
-/// contain commas and `""`-escaped quotes). Embedded newlines are not expected.
+/// Splits one CSV line, honouring quoted fields with commas and `""` escapes.
 fn parse_csv_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut cur = String::new();

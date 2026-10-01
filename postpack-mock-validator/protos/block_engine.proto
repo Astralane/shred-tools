@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+import "packet.proto";
+import "shared.proto";
+import "bundle.proto";
+
+package block_engine;
+
+message SubscribePacketsRequest {}
+message SubscribePacketsResponse {
+  shared.Header header = 1;
+  packet.PacketBatch batch = 2;
+}
+
+message SubscribeBundlesRequest {}
+message SubscribeBundlesResponse {
+  repeated bundle.BundleUuid bundles = 1;
+}
+
+message BlockBuilderFeeInfoRequest {}
+message BlockBuilderFeeInfoResponse {
+  string pubkey = 1;
+
+  uint64 commission = 2;
+}
+
+message AccountsOfInterest {
+  repeated string accounts = 1;
+}
+
+message AccountsOfInterestRequest {}
+message AccountsOfInterestUpdate {
+  repeated string accounts = 1;
+}
+
+message ProgramsOfInterestRequest {}
+message ProgramsOfInterestUpdate {
+  repeated string programs = 1;
+}
+
+message ExpiringPacketBatch {
+  shared.Header header = 1;
+  packet.PacketBatch batch = 2;
+  uint32 expiry_ms = 3;
+}
+
+message PacketBatchUpdate {
+  oneof msg {
+    ExpiringPacketBatch batches = 1;
+    shared.Heartbeat heartbeat = 2;
+  }
+}
+
+message StartExpiringPacketStreamResponse {
+  shared.Heartbeat heartbeat = 1;
+}
+
+message GetBlockEngineEndpointRequest {}
+
+message BlockEngineEndpoint {
+  string block_engine_url = 1;
+  string shredstream_receiver_address = 2;
+}
+
+message GetBlockEngineEndpointResponse {
+  BlockEngineEndpoint global_endpoint = 1;
+  repeated BlockEngineEndpoint regioned_endpoints = 2;
+}
+
+
+service BlockEngineValidator {
+  rpc SubscribePackets (SubscribePacketsRequest) returns (stream SubscribePacketsResponse) {}
+
+  rpc SubscribeBundles (SubscribeBundlesRequest) returns (stream SubscribeBundlesResponse) {}
+
+  rpc GetBlockBuilderFeeInfo (BlockBuilderFeeInfoRequest) returns (BlockBuilderFeeInfoResponse) {}
+
+  rpc GetBlockEngineEndpoints (GetBlockEngineEndpointRequest) returns (GetBlockEngineEndpointResponse) {}
+}
+
+service BlockEngineRelayer {
+  rpc SubscribeAccountsOfInterest (AccountsOfInterestRequest) returns (stream AccountsOfInterestUpdate) {}
+
+  rpc SubscribeProgramsOfInterest (ProgramsOfInterestRequest) returns (stream ProgramsOfInterestUpdate) {}
+
+  rpc StartExpiringPacketStream (stream PacketBatchUpdate) returns (stream StartExpiringPacketStreamResponse) {}
+}
