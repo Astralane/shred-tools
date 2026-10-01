@@ -14,6 +14,10 @@ pub enum RpcProvider {
 }
 
 impl RpcProvider {
+    pub fn omits_votes(self) -> bool {
+        matches!(self, Self::Shyft)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Generic => "generic",
@@ -115,6 +119,10 @@ impl std::fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 
 impl RpcEndpoint {
+    pub fn omits_votes(&self) -> bool {
+        self.provider.omits_votes()
+    }
+
     pub fn label(&self) -> String {
         format!("{} {}", self.provider.label(), self.base)
     }
@@ -249,5 +257,13 @@ mod tests {
                 .resolve()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_shyft_leaves_votes_out_of_get_block() {
+        assert!(RpcProvider::Shyft.omits_votes());
+        for p in [RpcProvider::Generic, RpcProvider::Helius, RpcProvider::Triton] {
+            assert!(!p.omits_votes());
+        }
     }
 }

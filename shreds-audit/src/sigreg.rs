@@ -97,6 +97,7 @@ pub struct SigRegistry {
     behind_n: Vec<u64>,
     behind_histogram: Vec<Histogram<u64>>,
     onchain: Option<SlotSigIndex>,
+    onchain_omits_votes: bool,
     rows: Vec<TxnRow>,
     collect_rows: bool,
     rotating: Vec<bool>,
@@ -198,6 +199,7 @@ impl SigRegistry {
             behind_n: vec![0; n],
             behind_histogram: (0..n).map(|_| behind_histogram()).collect(),
             onchain: None,
+            onchain_omits_votes: false,
             rows: Vec::new(),
             collect_rows: false,
             rotating: vec![false; n],
@@ -246,7 +248,8 @@ impl SigRegistry {
         self.high_slot = self.high_slot.max(slot);
         // Before the dedupe: the onchain audit must see re-deliveries the race ignores.
         if let Some(index) = &mut self.onchain {
-            if !self.rotating[sid] {
+            let vote_not_in_block = self.onchain_omits_votes && meta.is_vote == Some(true);
+            if !self.rotating[sid] && !vote_not_in_block {
                 index.record(sid, slot, &sig);
             }
         }
@@ -279,8 +282,9 @@ impl SigRegistry {
         std::mem::take(&mut self.rows)
     }
 
-    pub fn enable_onchain_index(&mut self, retain_slots: u64) {
+    pub fn enable_onchain_index(&mut self, retain_slots: u64, omits_votes: bool) {
         self.onchain = Some(SlotSigIndex::new(self.names.len(), retain_slots));
+        self.onchain_omits_votes = omits_votes;
     }
 
     pub fn onchain_tip(&self) -> u64 {
@@ -534,5 +538,24 @@ mod tests {
         // slot-10 row is finalized and retired; the fresh row stays in flight
         assert_eq!(r.contested_signatures(), 1);
         assert_eq!(r.export()[0].wins, 1);
+    }
+
+    #[test]
+    fn an_rpc_without_votes_keeps_votes_out_of_the_onchain_index() {
+        let vote = TxnMeta {
+            is_vote: Some(true),
+            ..TxnMeta::default()
+        };
+        let mut r = reg();
+        r.enable_onchain_index(32, true);
+        r.record_first(0, sig(1), 1, 100, vote);
+        assert!(r.take_onchain_slot(100).is_none());
+        r.record_first(0, sig(2), 2, 100, TxnMeta::default());
+        assert!(r.take_onchain_slot(100).is_some());
+
+        let mut r = reg();
+        r.enable_onchain_index(32, false);
+        r.record_first(0, sig(1), 1, 100, vote);
+        assert!(r.take_onchain_slot(100).is_some());
     }
 }

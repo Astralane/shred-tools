@@ -133,11 +133,13 @@ impl PgSink {
 }
 
 pub fn connection_url(cfg: &PostgresCfg) -> Result<String> {
-    let url = if cfg.url.trim().is_empty() {
-        std::env::var("DATABASE_URL").unwrap_or_default()
-    } else {
-        cfg.url.clone()
-    };
+    choose_url(std::env::var("DATABASE_URL").ok(), &cfg.url)
+}
+
+fn choose_url(env: Option<String>, config: &str) -> Result<String> {
+    let url = env
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| config.to_string());
     if url.trim().is_empty() {
         bail!(
             "export mode is `postgres` but no connection string was given — set \
@@ -603,22 +605,24 @@ mod tests {
         assert_eq!(deltas["shreds_parsed"], 40);
         assert_eq!(
             deltas.len(),
-            20,
+            21,
             "every field of Counters must reach the database; add one and this moves"
         );
     }
 
     #[test]
     fn a_missing_url_is_refused() {
-        let cfg = PostgresCfg {
-            url: "   ".into(),
-            flush_secs: 15,
-        };
-        if std::env::var("DATABASE_URL").is_ok() {
-            return;
-        }
-        let err = connection_url(&cfg).unwrap_err().to_string();
+        let err = choose_url(None, "   ").unwrap_err().to_string();
         assert!(err.contains("DATABASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn database_url_overrides_the_config_url() {
+        let config = "postgres://u:p@127.0.0.1:15432/db";
+        let env = "postgres://u:p@127.0.0.1:5432/db";
+        assert_eq!(choose_url(Some(env.into()), config).unwrap(), env);
+        assert_eq!(choose_url(Some("  ".into()), config).unwrap(), config);
+        assert_eq!(choose_url(None, config).unwrap(), config);
     }
 
     #[test]

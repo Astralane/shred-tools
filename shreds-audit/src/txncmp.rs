@@ -127,10 +127,15 @@ impl TxnCompare {
         if onchain.is_some() {
             eprintln!(
                 "txn-compare: auditing every source against the chain — sampling one slot every \
-                 {}s at {} slots behind the tip via getBlock on {}",
+                 {}s at {} slots behind the tip via getBlock on {}{}",
                 cfg.onchain_sample_secs,
                 cfg.onchain_lag_slots,
-                onchain_rpc.label()
+                onchain_rpc.label(),
+                if onchain_rpc.omits_votes() {
+                    " (votes excluded: this RPC leaves them out of getBlock)"
+                } else {
+                    ""
+                }
             );
         }
 
@@ -168,9 +173,6 @@ impl TxnCompare {
     }
 
     pub fn feed(&self, rx_unix_ns: i64, provider: u16, data: &[u8]) {
-        if !crate::verify::is_shred_payload(data) {
-            return;
-        }
         if let Some(feed) = &self.feed {
             let _ = feed.try_send(ShredInput {
                 rx_unix_ns,

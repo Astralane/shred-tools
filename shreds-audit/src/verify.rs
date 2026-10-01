@@ -5,6 +5,7 @@
 use ahash::AHashMap;
 use ed25519_dalek::{Signature as DalekSig, VerifyingKey};
 use rayon::prelude::*;
+use serde::Serialize;
 use solana_ledger::shred::layout;
 use solana_sdk::pubkey::Pubkey;
 
@@ -21,12 +22,14 @@ const CODING_NUM_CODING_OFFSET: usize = 85;
 const CODING_POSITION_OFFSET: usize = 87;
 const DATA_FLAGS_OFFSET: usize = 85;
 const CODING_HEADER_LEN: usize = 89;
+const SIZE_OF_SIGNATURE: usize = 64;
 const LAST_IN_SLOT_FLAGS: u8 = 0b1100_0000;
 const DATA_COMPLETE_FLAG: u8 = 0b0100_0000;
 
 type Triple = ([u8; 64], [u8; 32], Pubkey);
 
 pub struct VerifiedShred {
+    pub packet_index: usize,
     pub provider: ProviderId,
     pub rx_unix_ns: i64,
     pub slot: u64,
@@ -43,6 +46,7 @@ pub struct VerifiedShred {
     /// `None` when the slot's leader is unknown: no verdict, not a failure.
     pub sig_ok: Option<bool>,
     pub merkle_ok: bool,
+    pub proof_stripped: bool,
     /// FNV-1a of the full payload, for duplicate detection.
     pub payload_hash: u64,
     /// SHA-256 of the block data only (see `data_range`), so a broken proof can be
@@ -50,7 +54,25 @@ pub struct VerifiedShred {
     pub data_hash: Option<[u8; 32]>,
 }
 
-#[derive(Default, Clone, Copy)]
+impl VerifiedShred {
+    pub fn is_authentic(&self) -> bool {
+        self.merkle_ok && self.sig_ok != Some(false)
+    }
+}
+
+#[derive(Default, Clone, Copy, Serialize)]
+pub struct ProviderVerifyStats {
+    pub parsed: u64,
+    pub malformed: u64,
+    pub unsupported_variant: u64,
+    pub wrong_version: u64,
+    pub no_merkle_root: u64,
+    pub no_leader: u64,
+    pub sig_bad: u64,
+    pub proof_stripped: u64,
+}
+
+#[derive(Default, Clone)]
 pub struct VerifyStats {
     pub parsed: u64,
     pub malformed: u64,
@@ -60,12 +82,24 @@ pub struct VerifyStats {
     pub no_merkle_root: u64,
     pub no_leader: u64,
     pub sig_bad: u64,
+    pub proof_stripped: u64,
     pub ed25519_verifies: u64,
     pub batch_fallbacks: u64,
+    pub providers: Vec<ProviderVerifyStats>,
+}
+
+impl VerifyStats {
+    fn provider(&mut self, provider: ProviderId) -> &mut ProviderVerifyStats {
+        let index = provider as usize;
+        if index >= self.providers.len() {
+            self.providers.resize(index + 1, ProviderVerifyStats::default());
+        }
+        &mut self.providers[index]
+    }
 }
 
 pub fn verify_chunk(
-    packets: Vec<Packet>,
+    packets: &[Packet],
     schedule: &LeaderSchedule,
     shred_version: Option<u16>,
     stats: &mut VerifyStats,
@@ -75,10 +109,11 @@ pub fn verify_chunk(
     let mut dedup: AHashMap<([u8; 64], [u8; 32]), usize> = AHashMap::new();
     let mut triples: Vec<Triple> = Vec::new();
 
-    for p in packets {
+    for (packet_index, p) in packets.iter().enumerate() {
         let s: &[u8] = &p.data;
         if s.len() < CODING_HEADER_LEN + 1 {
             stats.malformed += 1;
+            stats.provider(p.provider).malformed += 1;
             continue;
         }
         // A relayed ping is a valid protocol message, not a provider defect.
@@ -88,11 +123,13 @@ pub fn verify_chunk(
         }
         if shred_version.is_some_and(|want| read_u16(s, VERSION_OFFSET) != want) {
             stats.wrong_version += 1;
+            stats.provider(p.provider).wrong_version += 1;
             continue;
         }
         // An unknown variant can't have its merkle root rebuilt; it must not count as invalid.
         let Some((is_code, _, _, _)) = decode_variant(s[VARIANT_OFFSET]) else {
             stats.unsupported_variant += 1;
+            stats.provider(p.provider).unsupported_variant += 1;
             continue;
         };
         let (Some(slot), Some(fec_set_index), Some(shred_index)) = (
@@ -101,21 +138,25 @@ pub fn verify_chunk(
             layout::get_index(s),
         ) else {
             stats.malformed += 1;
+            stats.provider(p.provider).malformed += 1;
             continue;
         };
 
         let leader = match schedule.classify(slot) {
             SlotVerdict::Implausible => {
                 stats.malformed += 1;
+                stats.provider(p.provider).malformed += 1;
                 continue;
             }
             SlotVerdict::Leader(pk) => Some(pk),
             SlotVerdict::Unknown => {
                 stats.no_leader += 1;
+                stats.provider(p.provider).no_leader += 1;
                 None
             }
         };
         stats.parsed += 1;
+        stats.provider(p.provider).parsed += 1;
 
         let (num_data, num_coding, position) = if is_code {
             (
@@ -134,6 +175,7 @@ pub fn verify_chunk(
         let merkle_ok = root.is_some();
         if !merkle_ok {
             stats.no_merkle_root += 1;
+            stats.provider(p.provider).no_merkle_root += 1;
         }
 
         let sig: [u8; 64] = s[..64].try_into().unwrap();
@@ -147,6 +189,7 @@ pub fn verify_chunk(
 
         pending.push((
             VerifiedShred {
+                packet_index,
                 provider: p.provider,
                 rx_unix_ns: p.rx_unix_ns,
                 slot,
@@ -161,6 +204,7 @@ pub fn verify_chunk(
                 leader,
                 sig_ok: None,
                 merkle_ok,
+                proof_stripped: proof_range(s).is_some_and(|range| s[range].iter().all(|&b| b == 0)),
                 payload_hash: fnv1a(s),
                 data_hash: data_range(s).map(|r| solana_sdk::hash::hash(&s[r]).to_bytes()),
             },
@@ -175,7 +219,13 @@ pub fn verify_chunk(
         .map(|(mut shred, key)| {
             shred.sig_ok = key.map(|i| verdicts[i]);
             if shred.sig_ok == Some(false) {
-                stats.sig_bad += 1;
+                if shred.proof_stripped {
+                    stats.proof_stripped += 1;
+                    stats.provider(shred.provider).proof_stripped += 1;
+                } else {
+                    stats.sig_bad += 1;
+                    stats.provider(shred.provider).sig_bad += 1;
+                }
             }
             shred
         })
@@ -235,34 +285,29 @@ fn decode_variant(variant: u8) -> Option<(bool, usize, bool, bool)> {
     Some((is_code, proof_size, chained, resigned))
 }
 
-pub fn is_shred_payload(payload: &[u8]) -> bool {
-    payload
-        .get(VARIANT_OFFSET)
-        .is_some_and(|&v| decode_variant(v).is_some())
-}
-
 /// The shred's block data: `[64..D)`, after the leader signature and before the
 /// authentication tail (chained root, merkle proof, retransmitter signature),
 /// where `D = SIZE_OF_PAYLOAD - 32*chained - 20*proof_size - 64*resigned`.
 /// Deliberately not agave's merkle leaf, which also covers the chained root: a
 /// relay that wrecks the tail has broken authentication, not altered block data.
 fn data_range(s: &[u8]) -> Option<std::ops::Range<usize>> {
+    let proof = proof_range(s)?;
+    (proof.start > SIZE_OF_SIGNATURE).then_some(SIZE_OF_SIGNATURE..proof.start)
+}
+
+pub(crate) fn proof_range(s: &[u8]) -> Option<std::ops::Range<usize>> {
     const SIZE_OF_DATA_PAYLOAD: usize = 1203;
     const SIZE_OF_CODE_PAYLOAD: usize = 1228;
     const SIZE_OF_MERKLE_ROOT: usize = 32;
     const SIZE_OF_PROOF_ENTRY: usize = 20;
-    const SIZE_OF_SIGNATURE: usize = 64;
 
     let (is_code, proof_size, chained, resigned) = decode_variant(*s.get(VARIANT_OFFSET)?)?;
     let payload = if is_code { SIZE_OF_CODE_PAYLOAD } else { SIZE_OF_DATA_PAYLOAD };
-    let tail = SIZE_OF_MERKLE_ROOT * usize::from(chained)
-        + SIZE_OF_PROOF_ENTRY * proof_size
-        + SIZE_OF_SIGNATURE * usize::from(resigned);
-    let proof_offset = payload.checked_sub(tail)?;
-    if proof_offset <= SIZE_OF_SIGNATURE || s.len() < proof_offset {
-        return None;
-    }
-    Some(SIZE_OF_SIGNATURE..proof_offset)
+    let proof_end = payload.checked_sub(SIZE_OF_SIGNATURE * usize::from(resigned))?;
+    let proof_start = proof_end
+        .checked_sub(SIZE_OF_MERKLE_ROOT * usize::from(chained) + SIZE_OF_PROOF_ENTRY * proof_size)?;
+    (proof_start > SIZE_OF_SIGNATURE && proof_start < proof_end && s.len() >= proof_end)
+        .then_some(proof_start..proof_end)
 }
 
 /// A Solana ping (`u32 = 4`, pubkey, 32-byte token, signature over the token).

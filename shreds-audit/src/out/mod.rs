@@ -129,6 +129,14 @@ pub struct WindowStats {
     pub invalid_sig: u64,
     pub invalid_data: u64,
     pub invalid_unknown: u64,
+    pub providers: Vec<ProviderInvalid>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ProviderInvalid {
+    pub invalid_sig: u64,
+    pub invalid_data: u64,
+    pub invalid_unknown: u64,
 }
 
 impl Default for WindowStats {
@@ -142,6 +150,7 @@ impl Default for WindowStats {
             invalid_sig: 0,
             invalid_data: 0,
             invalid_unknown: 0,
+            providers: Vec::new(),
         }
     }
 }
@@ -154,6 +163,14 @@ impl WindowStats {
             self.invalid_sig += r.invalid_sig as u64;
             self.invalid_data += r.invalid_data as u64;
             self.invalid_unknown += r.invalid_unknown as u64;
+            let index = r.provider as usize;
+            if index >= self.providers.len() {
+                self.providers.resize(index + 1, ProviderInvalid::default());
+            }
+            let provider = &mut self.providers[index];
+            provider.invalid_sig += r.invalid_sig as u64;
+            provider.invalid_data += r.invalid_data as u64;
+            provider.invalid_unknown += r.invalid_unknown as u64;
         }
     }
 
@@ -229,6 +246,17 @@ mod tests {
         assert_eq!(s.invalid_data, 2);
         assert_eq!(s.invalid_unknown, 3);
         assert_eq!(s.rows_sets, 0, "row counts come back from the sink, not the fold");
+    }
+
+    #[test]
+    fn window_stats_split_the_invalid_counts_by_provider() {
+        let mut other = set_row(1_000, 0, 4, 0);
+        other.provider = 2;
+        let mut s = WindowStats::default();
+        s.observe_sets(&[set_row(1_000, 1, 0, 0), other]);
+
+        let counts = |p: &ProviderInvalid| (p.invalid_sig, p.invalid_data, p.invalid_unknown);
+        assert_eq!(s.providers.iter().map(counts).collect::<Vec<_>>(), [(1, 0, 0), (0, 0, 0), (0, 4, 0)]);
     }
 
     #[test]

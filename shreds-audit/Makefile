@@ -51,7 +51,7 @@ logs: ## Tail logs (e.g. SERVICE=audit or default all)
 	$(COMPOSE) $(PROFILES) logs -f --tail=120 $(SERVICE)
 
 db-drop: ## Drop provider_stats table to re-init schema without wiping full DB
-	$(COMPOSE) exec postgres psql -U audit -d shredaudit -c "DROP TABLE IF EXISTS provider_stats CASCADE;"
+	$(COMPOSE) exec postgres psql -U postgres -d shred_audit -c "DROP TABLE IF EXISTS provider_stats CASCADE;"
 
 db-shell: ## Open interactive psql shell inside postgres container
-	$(COMPOSE) exec postgres psql -U audit -d shredaudit
+	$(COMPOSE) exec postgres psql -U postgres -d shred_audit

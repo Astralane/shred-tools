@@ -152,7 +152,7 @@ impl OnchainVerifier {
     ) -> Self {
         reg.lock()
             .unwrap()
-            .enable_onchain_index(lag_slots + RETAIN_MARGIN_SLOTS);
+            .enable_onchain_index(lag_slots + RETAIN_MARGIN_SLOTS, rpc.omits_votes());
         let audit = Arc::new(Mutex::new(OnchainAudit::new(n_sources)));
         let worker = Worker {
             rpc,

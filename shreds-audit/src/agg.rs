@@ -277,6 +277,7 @@ mod tests {
 
     fn shred(provider: ProviderId, slot: u64, fec: u32, pos: u32, rx: i64, hash: u64) -> VerifiedShred {
         VerifiedShred {
+            packet_index: 0,
             provider,
             rx_unix_ns: rx,
             slot,
@@ -291,6 +292,7 @@ mod tests {
             leader: None,
             sig_ok: Some(true),
             merkle_ok: true,
+            proof_stripped: false,
             payload_hash: hash,
             data_hash: Some(leaf(hash)),
         }

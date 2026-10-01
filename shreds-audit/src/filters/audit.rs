@@ -211,14 +211,16 @@ pub struct SlotTask {
 pub struct FilterAudit {
     state: Mutex<AHashMap<WindowKey, Window>>,
     sample_every: u64,
+    skip_votes: bool,
     reg: Arc<Mutex<SigRegistry>>,
 }
 
 impl FilterAudit {
-    pub fn new(sample_every: u64, reg: Arc<Mutex<SigRegistry>>) -> Arc<Self> {
+    pub fn new(sample_every: u64, skip_votes: bool, reg: Arc<Mutex<SigRegistry>>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(AHashMap::new()),
             sample_every,
+            skip_votes,
             reg,
         })
     }
@@ -338,8 +340,9 @@ impl FilterAudit {
             }
         }
 
-        let sampled =
-            slot.is_multiple_of(self.sample_every) && w.start_slot().is_some_and(|s| slot >= s);
+        let sampled = !(self.skip_votes && tx.is_vote())
+            && slot.is_multiple_of(self.sample_every)
+            && w.start_slot().is_some_and(|s| slot >= s);
         if sampled && w.sampled.entry(slot).or_default().insert(tx.signature, mask).is_some() {
             w.duplicates += 1;
             w.violation(
@@ -496,7 +499,7 @@ mod tests {
     #[test]
     fn only_fully_covered_confirmed_sampled_slots_are_handed_out() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg.clone());
+        let audit = FilterAudit::new(10, false, reg.clone());
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -515,7 +518,7 @@ mod tests {
     #[test]
     fn a_closed_window_stops_before_its_last_delivered_slot() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg.clone());
+        let audit = FilterAudit::new(10, false, reg.clone());
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -531,7 +534,7 @@ mod tests {
     #[test]
     fn a_stale_tip_at_subscribe_time_does_not_start_the_range_early() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg.clone());
+        let audit = FilterAudit::new(10, false, reg.clone());
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -554,7 +557,7 @@ mod tests {
     #[test]
     fn a_silent_window_is_still_checked_once_the_tip_moves_on() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg.clone());
+        let audit = FilterAudit::new(10, false, reg.clone());
         let key = (1, 0);
         audit.open(key, info(bundle("combo_never")));
         audit.subscribed(key);
@@ -570,7 +573,7 @@ mod tests {
     #[test]
     fn a_tag_the_filter_disagrees_with_is_a_violation() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("votes_split")));
         audit.subscribed(key);
@@ -596,7 +599,7 @@ mod tests {
     #[test]
     fn untagged_updates_in_a_multi_filter_bundle_are_counted_not_blamed() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("votes_split")));
         audit.subscribed(key);
@@ -608,7 +611,7 @@ mod tests {
     #[test]
     fn a_server_vote_flag_that_disagrees_with_the_rule_is_reported() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -619,7 +622,7 @@ mod tests {
     #[test]
     fn repeat_deliveries_in_a_sampled_slot_are_duplicates() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -632,7 +635,7 @@ mod tests {
     #[test]
     fn violations_are_capped_per_kind() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);
@@ -646,7 +649,7 @@ mod tests {
     #[test]
     fn a_window_that_never_subscribed_finishes_without_checks() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.close(key, "error: connect".into());
@@ -657,7 +660,7 @@ mod tests {
     #[test]
     fn a_window_that_delivered_waits_for_its_latency_to_be_folded() {
         let reg = reg_at(1000);
-        let audit = FilterAudit::new(10, reg);
+        let audit = FilterAudit::new(10, false, reg);
         let key = (1, 0);
         audit.open(key, info(bundle("all")));
         audit.subscribed(key);

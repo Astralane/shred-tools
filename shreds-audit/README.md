@@ -224,7 +224,10 @@ grpc_sources:
 `SubscribeDeshred` reports transactions reconstructed from shreds before
 execution, so it has no commitment or transaction-status metadata. Do not set
 `commitment` on a `deshred` source. Both modes are matched to locally
-reconstructed transactions by `transaction.signatures[0]`.
+reconstructed transactions by `transaction.signatures[0]`. The local
+reconstruction only uses shreds that pass verification (a valid merkle proof and
+a signature that is not bad), so invalid shreds a provider sends never reach its
+transactions; they are counted in the raw-shred stats instead.
 
 The two modes stay distinguishable everywhere they are reported. In the manifest
 and the dashboard each source carries a `kind` — `shreds` for the local shred
@@ -320,8 +323,12 @@ provider is one field:
 ```yaml
 rpc:
   provider: shyft          # generic | shyft | helius | triton
-  token: env:SHYFT_API_KEY # key read from the environment; never logged or stored
+  token: your-api-key     # never logged or stored; `env:NAME` reads it from $NAME
 ```
+
+Shyft leaves vote transactions out of `getBlock`. With `provider: shyft` both the
+onchain and the filter audit exclude votes on the source side too, so they compare
+non-vote transactions only; the startup log and the manifest notes say so.
 
 Set `rotate: false` on a source to keep one unfiltered subscription for the whole
 run (a stable latency baseline next to the rotating ones), or
@@ -331,13 +338,20 @@ run (a stable latency baseline next to the rotating ones), or
 
 ```sh
 docker compose up -d                                  # postgres + grafana on 127.0.0.1
-SHYFT_API_KEY=... cargo run --release -- --config config.yaml --export postgres --no-tui
+cargo run --release -- --config config.yaml --export postgres --no-tui
 ```
 
-Grafana (http://127.0.0.1:3000) is provisioned with two dashboards — `shred-audit`
-(providers, race) and **`shred-audit — filter audit`** (correctness per filter,
-violations, windows, getBlock health, latency per window and bundle) — and with
-the alert rules in `grafana/provisioning/alerting/filter-audit.yml`:
+The stack's Postgres listens on `127.0.0.1:5432` (user `postgres`, password
+`postgres`, database `shred_audit`). `$DATABASE_URL` overrides
+`export.postgres.url`, so one `config.yaml` works both ways: run natively it
+writes wherever the config points, and in the `audit` container compose sets
+`DATABASE_URL` to the stack's own Postgres.
+
+Grafana (http://127.0.0.1:3000) is provisioned with one dashboard, `shred-audit`,
+in the `shred-audit` folder: providers and the race on top, and three collapsed
+**Filter audit** rows at the bottom (correctness per filter, violations, windows,
+getBlock health, latency per window and bundle). The alert rules are in
+`grafana/provisioning/alerting/filter-audit.yml`:
 
 | alert | severity | fires when |
 |---|---|---|
@@ -361,7 +375,11 @@ Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:
 
 - **`manifest.json`** — details about the run, plus a **`notes`** section listing
   any data-quality caveats. **Always read the notes** — they tell you if a
-  capture was incomplete before you draw conclusions from it.
+  capture was incomplete before you draw conclusions from it. Its
+  **`provider_shreds`** section breaks the raw shreds down per provider: parsed,
+  malformed, wrong version, unsupported variant, no merkle root, no leader, bad
+  signature, stripped proof, and the `invalid_sig` / `invalid_data` /
+  `invalid_unknown` split.
 - **`fec_sets.parquet`** — one row per (provider, slot, FEC set) with timing,
   delivery counts, and validity. This is the table you compare providers on.
 - **`shreds.parquet`** — one row per shred, only present if you passed
@@ -396,6 +414,13 @@ reports are evidence you might hand back to a provider:
   actually signed. This is the serious one.
 - **can't tell** (`invalid_unknown`) — no provider gave a leader-signed copy of
   that exact shred to compare against, so it's never lumped in with the above.
+
+Separately, every shred that fails the signature check is counted either as
+`sig_bad` or, when its chained merkle root and proof are all zeros, as
+`proof_stripped`. A stripped shred carries the leader's genuine data with the
+authentication removed — typically a relay that rebuilt the shred with its own
+erasure recovery and forwarded it without the proof. A validator rejects it just
+the same, so it still counts as invalid, but it is not a forgery.
 
 Genuine Solana network pings that ride the same socket are recognised and
 excluded — they are never counted against a provider.

@@ -9,7 +9,7 @@ use crate::{
     registry::Registry,
     rx::RxStats,
     sigreg::SourceKind,
-    verify::VerifyStats,
+    verify::{ProviderVerifyStats, VerifyStats},
 };
 
 use super::{hostname, now_unix_ns, WindowStats};
@@ -38,6 +38,7 @@ pub struct Manifest {
     pub rows_shreds: u64,
     pub rows_txns: u64,
     pub counters: Counters,
+    pub provider_shreds: Vec<ProviderShreds>,
     pub provider_pings: Vec<ProviderPing>,
     pub leader_names: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +81,16 @@ pub struct TxnSource {
 }
 
 #[derive(Serialize, Clone)]
+pub struct ProviderShreds {
+    pub provider: String,
+    #[serde(flatten)]
+    pub verify: ProviderVerifyStats,
+    pub invalid_sig: u64,
+    pub invalid_data: u64,
+    pub invalid_unknown: u64,
+}
+
+#[derive(Serialize, Clone)]
 pub struct ProviderPing {
     pub provider: String,
     pub ip: String,
@@ -105,6 +116,7 @@ pub struct Counters {
     pub shreds_no_merkle_root: u64,
     pub shreds_no_leader: u64,
     pub shreds_sig_bad: u64,
+    pub shreds_proof_stripped: u64,
     pub invalid_sig: u64,
     pub invalid_data: u64,
     pub invalid_unknown: u64,
@@ -135,6 +147,7 @@ impl Counters {
             shreds_no_merkle_root: v.no_merkle_root,
             shreds_no_leader: v.no_leader,
             shreds_sig_bad: v.sig_bad,
+            shreds_proof_stripped: v.proof_stripped,
             invalid_sig: stats.invalid_sig,
             invalid_data: stats.invalid_data,
             invalid_unknown: stats.invalid_unknown,
@@ -282,12 +295,35 @@ pub fn build_manifest(
         rows_fec_sets: stats.rows_sets,
         rows_shreds: stats.rows_shreds,
         rows_txns: stats.rows_txns,
+        provider_shreds: provider_shreds(registry, vstats, stats),
         provider_pings: netmon.provider_pings(cfg, registry),
         leader_names: schedule.leader_names(),
         txn_compare: txn.cloned(),
         counters,
         notes,
     }
+}
+
+fn provider_shreds(
+    registry: &Registry,
+    vstats: &VerifyStats,
+    stats: &WindowStats,
+) -> Vec<ProviderShreds> {
+    registry
+        .names()
+        .iter()
+        .enumerate()
+        .map(|(id, name)| {
+            let invalid = stats.providers.get(id).copied().unwrap_or_default();
+            ProviderShreds {
+                provider: name.clone(),
+                verify: vstats.providers.get(id).copied().unwrap_or_default(),
+                invalid_sig: invalid.invalid_sig,
+                invalid_data: invalid.invalid_data,
+                invalid_unknown: invalid.invalid_unknown,
+            }
+        })
+        .collect()
 }
 
 fn onchain_notes(cfg: &Config, txn: &TxnCompareSummary) -> Vec<String> {
@@ -301,6 +337,13 @@ fn onchain_notes(cfg: &Config, txn: &TxnCompareSummary) -> Vec<String> {
                 .to_string(),
         );
         return notes;
+    }
+    if cfg.onchain_rpc_endpoint().is_ok_and(|rpc| rpc.omits_votes()) {
+        notes.push(
+            "the onchain audit's RPC leaves vote transactions out of getBlock, so votes are \
+             excluded on both sides: every `onchain_*` count covers non-vote transactions only"
+                .to_string(),
+        );
     }
     if txn.onchain_slots_checked == 0 {
         notes.push(format!(

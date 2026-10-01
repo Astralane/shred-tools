@@ -67,10 +67,218 @@
         "hide": 0,
         "current": {},
         "options": []
+      },
+      {
+        "name": "source",
+        "label": "gRPC source (filter audit)",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shredaudit-pg"
+        },
+        "query": "SELECT DISTINCT source FROM filter_windows WHERE host = '$host' ORDER BY 1",
+        "definition": "SELECT DISTINCT source FROM filter_windows WHERE host = '$host' ORDER BY 1",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": []
       }
     ]
   },
   "panels": [
+    {
+      "type": "table",
+      "title": "Errors and RPC coverage — over the selected range",
+      "description": "One row per check. `error %` is errors / checked. `slots verified against RPC %` is the share of all slots produced in the range (about one per 400 ms) whose block was fetched with getBlock and compared; the onchain audit samples one slot every few seconds and the filter audit every Nth slot, so 100% is never the target, but a value near 0 means the RPC is failing (see the getBlock row) and nothing is being verified.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1000,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "WITH\nslots AS (SELECT GREATEST(($__unixEpochTo() - $__unixEpochFrom()) / 0.4, 1) AS n),\ncounters AS (\n  SELECT COALESCE(SUM(value) FILTER (WHERE name = 'shreds_parsed'), 0) AS parsed,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_sig_bad'), 0) AS sig_bad,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_proof_stripped'), 0) AS stripped\n  FROM audit_counters WHERE $__timeFilter(ts) AND host = '$host'),\ndelivery AS (\n  SELECT COALESCE(SUM(shreds_data + shreds_code + missed), 0) AS expected,\n         COALESCE(SUM(missed), 0) AS missed\n  FROM provider_stats WHERE $__timeFilter(ts) AND host = '$host'),\nonchain_rows AS (\n  SELECT source, onchain_txns, onchain_bad, onchain_slots_checked,\n         onchain_txns - LAG(onchain_txns) OVER w AS d_txns,\n         onchain_bad - LAG(onchain_bad) OVER w AS d_bad,\n         onchain_slots_checked - LAG(onchain_slots_checked) OVER w AS d_slots\n  FROM txn_source_stats WHERE $__timeFilter(ts) AND host = '$host'\n  WINDOW w AS (PARTITION BY source ORDER BY ts)),\nonchain_by_source AS (\n  SELECT source,\n         SUM(CASE WHEN d_txns < 0 THEN onchain_txns ELSE COALESCE(d_txns, 0) END) AS txns,\n         SUM(CASE WHEN d_bad < 0 THEN onchain_bad ELSE COALESCE(d_bad, 0) END) AS bad,\n         SUM(CASE WHEN d_slots < 0 THEN onchain_slots_checked ELSE COALESCE(d_slots, 0) END) AS slots\n  FROM onchain_rows GROUP BY source),\nonchain AS (\n  SELECT COALESCE(SUM(txns), 0) AS txns, COALESCE(SUM(bad), 0) AS bad, COALESCE(MAX(slots), 0) AS slots\n  FROM onchain_by_source),\nfilters AS (\n  SELECT COALESCE(SUM(expected), 0) AS expected,\n         COALESCE(SUM(missed + extra_in_block), 0) AS errors,\n         COALESCE(MAX(slots), 0) AS slots\n  FROM (SELECT source, SUM(expected) AS expected, SUM(missed) AS missed,\n               SUM(extra_in_block) AS extra_in_block, SUM(slots_checked) AS slots\n        FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host'\n        GROUP BY source) per_source),\nrpc AS (\n  SELECT COUNT(*) AS calls, COUNT(*) FILTER (WHERE status <> 'ok') AS failed\n  FROM rpc_block_fetches WHERE $__timeFilter(ts) AND host = '$host')\nSELECT * FROM (\n  SELECT 1 AS ord, 'Shreds: bad signature (forged)' AS \"check\", parsed AS checked, sig_bad AS errors,\n         100.0 * sig_bad / NULLIF(parsed, 0) AS \"error %\", NULL::float AS \"slots verified against RPC %\" FROM counters\n  UNION ALL SELECT 2, 'Shreds: Merkle proof stripped', parsed, stripped,\n         100.0 * stripped / NULLIF(parsed, 0), NULL FROM counters\n  UNION ALL SELECT 3, 'Shreds: missed (never delivered)', expected, missed,\n         100.0 * missed / NULLIF(expected, 0), NULL FROM delivery\n  UNION ALL SELECT 4, 'Transactions vs chain (onchain audit)', txns, bad,\n         100.0 * bad / NULLIF(txns, 0), 100.0 * slots / slots.n FROM onchain, slots\n  UNION ALL SELECT 5, 'gRPC filters vs chain (filter audit)', expected, errors,\n         100.0 * errors / NULLIF(expected, 0), 100.0 * filters.slots / slots.n FROM filters, slots\n  UNION ALL SELECT 6, 'RPC getBlock calls', calls, failed,\n         100.0 * failed / NULLIF(calls, 0), NULL FROM rpc\n) summary ORDER BY ord"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "noValue": "—"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ord"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "check"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 320
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "checked"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "errors"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.1
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "slots verified against RPC %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 2
+                    },
+                    {
+                      "color": "green",
+                      "value": 5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
     {
       "id": 1,
       "type": "timeseries",
@@ -82,7 +290,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 0,
+        "y": 8,
         "w": 8,
         "h": 8
       },
@@ -141,7 +349,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 0,
+        "y": 8,
         "w": 8,
         "h": 8
       },
@@ -199,7 +407,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 0,
+        "y": 8,
         "w": 8,
         "h": 8
       },
@@ -257,7 +465,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 8,
+        "y": 16,
         "w": 12,
         "h": 7
       },
@@ -317,7 +525,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 15,
+        "y": 23,
         "w": 24,
         "h": 7
       },
@@ -380,7 +588,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 8,
+        "y": 16,
         "w": 12,
         "h": 7
       },
@@ -439,7 +647,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 22,
+        "y": 30,
         "w": 8,
         "h": 7
       },
@@ -498,7 +706,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 22,
+        "y": 30,
         "w": 8,
         "h": 7
       },
@@ -555,7 +763,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 22,
+        "y": 30,
         "w": 8,
         "h": 7
       },
@@ -612,7 +820,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 29,
+        "y": 37,
         "w": 12,
         "h": 7
       },
@@ -669,7 +877,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 29,
+        "y": 37,
         "w": 12,
         "h": 7
       },
@@ -726,7 +934,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 44,
         "w": 12,
         "h": 7
       },
@@ -783,7 +991,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 36,
+        "y": 44,
         "w": 12,
         "h": 7
       },
@@ -840,7 +1048,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 43,
+        "y": 51,
         "w": 12,
         "h": 7
       },
@@ -882,7 +1090,7 @@
           "format": "time_series",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT ts AS time,\n       name AS metric,\n       value::float / NULLIF(window_secs, 0) AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('udp_received', 'shreds_parsed', 'shreds_sig_bad')\nORDER BY ts"
+          "rawSql": "SELECT ts AS time,\n       name AS metric,\n       value::float / NULLIF(window_secs, 0) AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('udp_received', 'shreds_parsed', 'shreds_sig_bad', 'shreds_proof_stripped')\nORDER BY ts"
         }
       ]
     },
@@ -897,7 +1105,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 43,
+        "y": 51,
         "w": 12,
         "h": 7
       },
@@ -955,7 +1163,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 50,
+        "y": 58,
         "w": 24,
         "h": 7
       },
@@ -1012,7 +1220,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 65,
         "w": 24,
         "h": 8
       },
@@ -1048,6 +1256,1323 @@
           "rawQuery": true,
           "editorMode": "code",
           "rawSql": "SELECT DISTINCT ON (source)\n       source,\n       kind,\n       seen,\n       contested,\n       winrate * 100        AS \"win %\",\n       behind_p50_us       AS \"p50 µs\",\n       behind_p90_us       AS \"p90 µs\",\n       behind_p99_us       AS \"p99 µs\",\n       onchain_missed      AS \"missed\",\n       onchain_corrupted   AS \"corrupted\",\n       onchain_duplicated  AS \"duplicated\",\n       onchain_bad_pct * 100 AS \"onchain bad %\"\nFROM txn_source_stats\nWHERE $__timeFilter(ts) AND host = '$host'\nORDER BY source, ts DESC"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Filter audit — Correctness — every value here should be 0 or near it",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 73,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 101,
+          "type": "stat",
+          "title": "Filter false positives",
+          "description": "Delivered with a filter's tag, in the confirmed block, but the filter rejects it (filter_slot_checks.extra_in_block). A server-side filter bug. Must be 0.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 74,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT COALESCE(SUM(extra_in_block),0) AS value FROM filter_slot_checks WHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)"
+            }
+          ]
+        },
+        {
+          "id": 102,
+          "type": "stat",
+          "title": "Tag errors (self-check)",
+          "description": "Checked on EVERY delivery, not sampled: a tag on a transaction the filter rejects, or a matching transaction delivered without its tag (filter_windows.tag_false_positive + tag_missing). Must be 0.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 6,
+            "y": 74,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT COALESCE(SUM(tag_false_positive + tag_missing),0) AS value FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source)"
+            }
+          ]
+        },
+        {
+          "id": 103,
+          "type": "stat",
+          "title": "Missed rate",
+          "description": "Block transactions a filter accepts that were not delivered with its tag, over all sampled slots in range.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 74,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.1
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.5
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT SUM(missed)::float / NULLIF(SUM(expected),0) * 100 AS value FROM filter_slot_checks WHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)"
+            }
+          ]
+        },
+        {
+          "id": 104,
+          "type": "stat",
+          "title": "Slots checked",
+          "description": "Sampled slots compared against getBlock in range (all sources). Flat means the audit is not running — see RPC health.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 18,
+            "y": 74,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT COUNT(DISTINCT (source, slot)) AS value FROM filter_slot_checks WHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source) AND block_status = 'ok'"
+            }
+          ]
+        },
+        {
+          "id": 105,
+          "type": "timeseries",
+          "title": "Missed rate per filter",
+          "description": "SUM(missed)/SUM(expected) per 5 minutes. A filter that runs intermittently (rotation) shows gaps between its windows — that is expected.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 78,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ts, '5m'), source || ' / ' || filter AS metric,\n       SUM(missed)::float / NULLIF(SUM(expected),0) * 100 AS value\nFROM filter_slot_checks\nWHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 106,
+          "type": "timeseries",
+          "title": "Filter false positives per filter",
+          "description": "extra_in_block per 5 minutes. Must be 0; anything here is a server filter bug — see the violations table for signatures and the failing clause.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 78,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 30,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "bars",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ts, '5m'), source || ' / ' || filter AS metric, SUM(extra_in_block) AS value\nFROM filter_slot_checks\nWHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2 HAVING SUM(extra_in_block) > 0 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 107,
+          "type": "timeseries",
+          "title": "Not in the confirmed block (forks / phantoms)",
+          "description": "Delivered, but absent from the confirmed block (extra_not_in_block), as a share of deliveries. Pre-execution feeds carry some transactions from forks that lost, so a low steady rate is normal; a jump is not. Skipped slots count here too.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 86,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ts, '5m'), source AS metric,\n       SUM(extra_not_in_block)::float / NULLIF(SUM(delivered),0) * 100 AS value\nFROM filter_slot_checks\nWHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 108,
+          "type": "timeseries",
+          "title": "Self-check per window",
+          "description": "Counted on every delivery of every window: tag false positives, missing tags, the server's is_vote disagreeing with the simple-vote rule, and repeat deliveries. Points are per window (at its end).",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 86,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 30,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "bars",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT ended_at AS time, source || ' tag_fp' AS metric, tag_false_positive AS value FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND tag_false_positive > 0\nUNION ALL\nSELECT ended_at, source || ' tag_missing', tag_missing FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND tag_missing > 0\nUNION ALL\nSELECT ended_at, source || ' vote_flag', vote_flag_mismatch FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND vote_flag_mismatch > 0\nUNION ALL\nSELECT ended_at, source || ' duplicates', duplicates FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND duplicates > 0\nUNION ALL\nSELECT ended_at, source || ' unknown/untagged', unknown_tags + untagged_updates FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND unknown_tags + untagged_updates > 0\nORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 109,
+          "type": "table",
+          "title": "Per filter over the range",
+          "description": "Everything the chain check measured, per (source, bundle, filter). Sort by missed % or extra_in_block.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 94,
+            "w": 24,
+            "h": 9
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT source, bundle, filter,\n       COUNT(*) FILTER (WHERE block_status = 'ok') AS slots,\n       COUNT(*) FILTER (WHERE block_status = 'skipped') AS skipped,\n       SUM(expected) AS expected, SUM(delivered) AS delivered, SUM(matched) AS matched,\n       SUM(missed) AS missed,\n       ROUND((SUM(missed)::numeric / NULLIF(SUM(expected),0) * 100), 4) AS missed_pct,\n       SUM(extra_in_block) AS extra_in_block,\n       SUM(extra_not_in_block) AS extra_not_in_block\nFROM filter_slot_checks\nWHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2, 3 ORDER BY missed_pct DESC NULLS LAST, 1, 2, 3"
+            }
+          ]
+        },
+        {
+          "id": 110,
+          "type": "table",
+          "title": "Violations — example transactions",
+          "description": "Up to 25 examples per (window, filter, kind); the counters elsewhere are exact. reason says which clause the filter used or failed, and whether a key came from a lookup table.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 103,
+            "w": 24,
+            "h": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT ts, source, bundle, filter, slot, violation, signature, reason\nFROM filter_violations\nWHERE $__timeFilter(ts) AND host = '$host' AND source IN ($source)\nORDER BY ts DESC LIMIT 300"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 111,
+      "type": "row",
+      "title": "Filter audit — Rotation and ground truth",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 74,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 112,
+          "type": "table",
+          "title": "Recent windows",
+          "description": "One row per subscription window. end_reason other than 'rotated' is a stream or connect error.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 75,
+            "w": 24,
+            "h": 10
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT started_at, source, bundle, ROUND(duration_secs::numeric, 1) AS secs, end_reason,\n       delivered, slots_checked AS slots, slots_skipped AS skipped, slots_unchecked AS unchecked,\n       expected, missed, extra_in_block, extra_not_in_block,\n       tag_false_positive AS tag_fp, tag_missing, vote_flag_mismatch AS vote_flag,\n       ROUND(connect_ms::numeric, 0) AS connect_ms, ROUND(first_msg_ms::numeric, 0) AS first_msg_ms,\n       ROUND((vs_shred_p50_us / 1000)::numeric, 2) AS vs_shred_p50_ms\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source)\nORDER BY started_at DESC LIMIT 200"
+            }
+          ]
+        },
+        {
+          "id": 113,
+          "type": "timeseries",
+          "title": "Window errors",
+          "description": "Windows per 10 minutes that ended in an error instead of rotating.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 85,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 30,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "bars",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "short",
+              "noValue": "0"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '10m'), source AS metric, COUNT(*) AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND end_reason LIKE 'error%'\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 114,
+          "type": "timeseries",
+          "title": "Connect and first message",
+          "description": "Per window: connect + subscribe, and time to the first message of any kind.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 8,
+            "y": 85,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT ended_at AS time, source || ' connect' AS metric, connect_ms AS value FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND connect_ms IS NOT NULL\nUNION ALL\nSELECT ended_at, source || ' first msg', first_msg_ms FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND first_msg_ms IS NOT NULL\nORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 115,
+          "type": "timeseries",
+          "title": "getBlock health",
+          "description": "Every getBlock the filter audit made, by status per 5 minutes. No 'ok' means no ground truth: nothing else on this dashboard is being checked.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 16,
+            "y": 85,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 30,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "bars",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ts, '5m'), status AS metric, COUNT(*) AS value\nFROM rpc_block_fetches\nWHERE $__timeFilter(ts) AND host = '$host'\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 116,
+          "type": "timeseries",
+          "title": "getBlock latency",
+          "description": "Per call, successful fetches only.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 93,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT ts AS time, rpc AS metric, latency_ms AS value\nFROM rpc_block_fetches\nWHERE $__timeFilter(ts) AND host = '$host' AND status = 'ok'\nORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 117,
+          "type": "timeseries",
+          "title": "Deliveries per second per window",
+          "description": "delivered / duration, per window and bundle — a filter that suddenly delivers far less (or nothing) shows here before it shows as misses.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 93,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT ended_at AS time, source || ' / ' || bundle AS metric, delivered / NULLIF(duration_secs, 0) AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source)\nORDER BY 1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 118,
+      "type": "row",
+      "title": "Filter audit — Latency — per window, against the shred providers and the other sources",
+      "collapsed": true,
+      "gridPos": {
+        "x": 0,
+        "y": 75,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 119,
+          "type": "timeseries",
+          "title": "vs fastest shred provider — p50",
+          "description": "Per window: this feed's arrival minus the earliest shred provider's for the same transaction. Negative = the feed was ahead of every shred provider. Needs shred providers in the config.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 76,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '5m'), source AS metric, AVG(vs_shred_p50_us) / 1000 AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND vs_shred_p50_us IS NOT NULL\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 120,
+          "type": "timeseries",
+          "title": "vs fastest shred provider — p90",
+          "description": "Same as p50, 90th percentile per window, averaged per 5 minutes.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 76,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '5m'), source AS metric, AVG(vs_shred_p90_us) / 1000 AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND vs_shred_p90_us IS NOT NULL\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 121,
+          "type": "timeseries",
+          "title": "Behind the earliest source — p50 / p90",
+          "description": "Per window, over transactions at least two sources delivered: how far behind the first arrival from ANY source.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 84,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '5m'), source || ' p50' AS metric, AVG(behind_p50_us) / 1000 AS value\nFROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND behind_p50_us IS NOT NULL GROUP BY 1, 2\nUNION ALL\nSELECT $__timeGroupAlias(ended_at, '5m'), source || ' p90', AVG(behind_p90_us) / 1000\nFROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND behind_p90_us IS NOT NULL GROUP BY 1, 2\nORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 122,
+          "type": "timeseries",
+          "title": "Winrate",
+          "description": "Share of contested transactions this feed delivered first, per 5 minutes.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 8,
+            "y": 84,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '5m'), source AS metric, SUM(wins)::float / NULLIF(SUM(contested),0) * 100 AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 123,
+          "type": "timeseries",
+          "title": "Server delay — receive minus created_at, p50",
+          "description": "Our receive time minus the server's created_at timestamp. Crosses two clocks, so it includes the skew between them: watch the trend, not the level.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 16,
+            "y": 84,
+            "w": 8,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 6,
+                "showPoints": "auto",
+                "spanNulls": false,
+                "drawStyle": "line",
+                "axisSoftMin": 0
+              },
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "calcs": [
+                "mean",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "time_series",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT $__timeGroupAlias(ended_at, '5m'), source AS metric, AVG(server_delay_p50_us) / 1000 AS value\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source) AND server_delay_p50_us IS NOT NULL\nGROUP BY 1, 2 ORDER BY 1"
+            }
+          ]
+        },
+        {
+          "id": 124,
+          "type": "table",
+          "title": "Latency by bundle over the range",
+          "description": "Does a filter make delivery slower? Averages of the per-window percentiles.",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 92,
+            "w": 24,
+            "h": 9
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-postgresql-datasource",
+                "uid": "shredaudit-pg"
+              },
+              "format": "table",
+              "rawQuery": true,
+              "editorMode": "code",
+              "rawSql": "SELECT source, bundle, COUNT(*) AS windows, SUM(delivered) AS delivered,\n       ROUND((AVG(vs_shred_p50_us) / 1000)::numeric, 2) AS vs_shred_p50_ms,\n       ROUND((AVG(vs_shred_p90_us) / 1000)::numeric, 2) AS vs_shred_p90_ms,\n       ROUND((AVG(behind_p50_us) / 1000)::numeric, 2) AS behind_p50_ms,\n       ROUND((SUM(wins)::numeric / NULLIF(SUM(contested),0) * 100), 2) AS winrate_pct,\n       ROUND(AVG(first_msg_ms)::numeric, 0) AS first_msg_ms\nFROM filter_windows\nWHERE $__timeFilter(ended_at) AND host = '$host' AND source IN ($source)\nGROUP BY 1, 2 ORDER BY 1, 2"
+            }
+          ]
         }
       ]
     }

@@ -47,6 +47,50 @@ fn packets(shreds: &[Vec<u8>]) -> Vec<Packet> {
         .collect()
 }
 
+#[test]
+fn counts_rejects_per_provider_and_marks_forgeries_not_authentic() {
+    let leader = Keypair::new();
+    let slot = 1000;
+    let shreds = make_real_shreds(slot, &leader);
+    let sched = LeaderSchedule::for_test(slot, vec![Some(leader.pubkey())]);
+    let mut forged = shreds[0].clone();
+    forged[100] ^= 0xff;
+    let input = vec![
+        Packet { provider: 0, rx_unix_ns: 1, data: shreds[0].clone() },
+        Packet { provider: 1, rx_unix_ns: 2, data: forged },
+        Packet { provider: 1, rx_unix_ns: 3, data: vec![0; 10] },
+    ];
+
+    let mut stats = VerifyStats::default();
+    let out = verify_chunk(&input, &sched, None, &mut stats);
+
+    let authentic: Vec<_> = out.iter().map(|s| (s.packet_index, s.is_authentic())).collect();
+    assert_eq!(authentic, [(0, true), (1, false)]);
+    let counts = |p: &crate::verify::ProviderVerifyStats| (p.parsed, p.sig_bad, p.malformed);
+    assert_eq!(counts(&stats.providers[0]), (1, 0, 0));
+    assert_eq!(counts(&stats.providers[1]), (1, 1, 1));
+}
+
+#[test]
+fn a_zeroed_merkle_proof_is_proof_stripped_not_a_bad_signature() {
+    let leader = Keypair::new();
+    let slot = 1000;
+    let shreds = make_real_shreds(slot, &leader);
+    let sched = LeaderSchedule::for_test(slot, vec![Some(leader.pubkey())]);
+    let mut stripped = shreds[0].clone();
+    let range = crate::verify::proof_range(&stripped).unwrap();
+    stripped[range].fill(0);
+    let mut forged = shreds[1].clone();
+    forged[100] ^= 0xff;
+
+    let mut stats = VerifyStats::default();
+    let out = verify_chunk(&packets(&[stripped, forged]), &sched, None, &mut stats);
+
+    assert!(out.iter().all(|s| s.sig_ok == Some(false)));
+    assert_eq!((stats.proof_stripped, stats.sig_bad), (1, 1));
+    assert_eq!(stats.providers[0].proof_stripped, 1);
+}
+
 /// `token[28]` is datagram byte 64, where a shred's kind is read from.
 fn make_ping(sender: &Keypair, kind_bits: u8) -> Vec<u8> {
     let mut token = [7u8; 32];
@@ -68,7 +112,7 @@ fn ping_is_not_a_shred_and_not_a_defect() {
 
     let sched = LeaderSchedule::for_test(1000, vec![Some(Keypair::new().pubkey())]);
     let mut stats = VerifyStats::default();
-    let out = verify_chunk(packets(&pings), &sched, None, &mut stats);
+    let out = verify_chunk(&packets(&pings), &sched, None, &mut stats);
 
     assert!(out.is_empty(), "a ping must never reach the aggregator as a shred");
     assert_eq!(stats.non_shred_ping, 2, "both pings should be recognised");
@@ -91,7 +135,7 @@ fn data_hash_covers_block_content_and_only_block_content() {
 
     // No `shred_version` filter: flipped version bytes would just be dropped.
     let mut stats = VerifyStats::default();
-    let base = verify_chunk(packets(&shreds), &sched, None, &mut stats);
+    let base = verify_chunk(&packets(&shreds), &sched, None, &mut stats);
     assert!(base.iter().all(|s| s.sig_ok == Some(true)));
 
     let i = base.iter().position(|s| !s.is_code).expect("a data shred");
@@ -103,7 +147,7 @@ fn data_hash_covers_block_content_and_only_block_content() {
         let mut p = payload.clone();
         p[off] ^= 0xff;
         let mut st = VerifyStats::default();
-        let out = verify_chunk(packets(&[p]), &sched, None, &mut st);
+        let out = verify_chunk(&packets(&[p]), &sched, None, &mut st);
 
         // A dropped shred (e.g. corrupted slot) counts as both moved and rejected.
         let (hash, verified) = match out.first() {
@@ -171,7 +215,7 @@ fn ping_with_a_bad_signature_is_not_excused_as_a_ping() {
 
     let sched = LeaderSchedule::for_test(1000, vec![Some(Keypair::new().pubkey())]);
     let mut stats = VerifyStats::default();
-    verify_chunk(packets(&[ping]), &sched, None, &mut stats);
+    verify_chunk(&packets(&[ping]), &sched, None, &mut stats);
 
     assert_eq!(stats.non_shred_ping, 0, "only a verified ping may be called a ping");
     assert_eq!(stats.malformed, 1, "anything else stays malformed");
@@ -186,7 +230,7 @@ fn real_leader_signed_shreds_verify_ok() {
 
     let sched = LeaderSchedule::for_test(slot, vec![Some(leader.pubkey())]);
     let mut stats = VerifyStats::default();
-    let out = verify_chunk(packets(&shreds), &sched, Some(42), &mut stats);
+    let out = verify_chunk(&packets(&shreds), &sched, Some(42), &mut stats);
 
     assert_eq!(out.len(), shreds.len(), "all shreds should parse");
     assert!(out.iter().all(|s| s.merkle_ok), "every shred's merkle root should reconstruct");
@@ -212,7 +256,7 @@ fn flipped_signature_is_rejected() {
     }
     let sched = LeaderSchedule::for_test(slot, vec![Some(leader.pubkey())]);
     let mut stats = VerifyStats::default();
-    let out = verify_chunk(packets(&shreds), &sched, Some(42), &mut stats);
+    let out = verify_chunk(&packets(&shreds), &sched, Some(42), &mut stats);
 
     assert!(
         out.iter().all(|s| s.sig_ok == Some(false)),
@@ -230,7 +274,7 @@ fn wrong_leader_is_rejected() {
 
     let sched = LeaderSchedule::for_test(slot, vec![Some(impostor.pubkey())]);
     let mut stats = VerifyStats::default();
-    let out = verify_chunk(packets(&shreds), &sched, Some(42), &mut stats);
+    let out = verify_chunk(&packets(&shreds), &sched, Some(42), &mut stats);
 
     assert!(
         out.iter().all(|s| s.sig_ok == Some(false)),
@@ -246,7 +290,7 @@ fn unknown_leader_is_unverifiable_not_bad() {
 
     let sched = LeaderSchedule::for_test(slot + 10_000, vec![Some(leader.pubkey())]);
     let mut stats = VerifyStats::default();
-    let out = verify_chunk(packets(&shreds), &sched, Some(42), &mut stats);
+    let out = verify_chunk(&packets(&shreds), &sched, Some(42), &mut stats);
 
     assert!(out.iter().all(|s| s.sig_ok.is_none()), "no leader -> no verdict");
     assert_eq!(stats.sig_bad, 0, "unknown leader must never be counted as a bad signature");
@@ -266,7 +310,7 @@ fn an_unparseable_variant_is_counted_not_condemned() {
         s[64] = variant;
 
         let mut stats = VerifyStats::default();
-        let out = verify_chunk(packets(&[s]), &sched, None, &mut stats);
+        let out = verify_chunk(&packets(&[s]), &sched, None, &mut stats);
 
         assert!(out.is_empty(), "variant {variant:#04x} must not reach the aggregator");
         assert_eq!(stats.unsupported_variant, 1, "variant {variant:#04x} must be counted");

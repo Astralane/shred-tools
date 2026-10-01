@@ -6,12 +6,12 @@ datasources:
     type: grafana-postgresql-datasource
     access: proxy
     url: postgres:5432
-    user: audit
-    database: shredaudit
+    user: postgres
+    database: shred_audit
     isDefault: true
     jsonData:
       sslmode: disable
       postgresVersion: 1600
       timescaledb: false
     secureJsonData:
-      password: audit
+      password: postgres

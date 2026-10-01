@@ -86,16 +86,21 @@ impl FilterAuditor {
             None => (DbHandle::disabled(), None),
         };
         let fr = &cfg.filter_rotation;
-        let audit = FilterAudit::new(fr.sample_every_slots, reg.clone());
+        let audit = FilterAudit::new(fr.sample_every_slots, rpc.omits_votes(), reg.clone());
         eprintln!(
             "filter-audit: rotating {} gRPC source(s) through {} bundle(s), {}-{}s per window; \
-             checking every {}th slot against getBlock via {}{}",
+             checking every {}th slot against getBlock via {}{}{}",
             cfg.grpc_sources.iter().filter(|g| cfg.rotating(g)).count(),
             fr.effective_bundles().len(),
             fr.min_secs,
             fr.max_secs,
             fr.sample_every_slots,
             rpc.label(),
+            if rpc.omits_votes() {
+                " (votes excluded: this RPC leaves them out of getBlock)"
+            } else {
+                ""
+            },
             if db_writer.is_some() {
                 ""
             } else {

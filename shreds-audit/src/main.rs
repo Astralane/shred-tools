@@ -284,7 +284,7 @@ fn main() -> Result<()> {
             }
         } else if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();
-            report(&rx_stats, &vstats, &aggregator, stats.invalid_data);
+            report(&rx_stats, &vstats, &aggregator, &stats, registry.names());
         }
 
         if args.live && last_live.elapsed() >= Duration::from_secs(live_secs) {
@@ -374,7 +374,6 @@ fn main() -> Result<()> {
             eprintln!("final live snapshot failed: {e:#}");
         }
     }
-    let bad_data = stats.invalid_data;
     let manifest = build_manifest(
         &stats, &cfg, &registry, &netmon, &schedule, &rx_stats, &vstats, txn_snap.as_ref(),
         aggregator.shreds_after_window(), window_start,
@@ -384,7 +383,7 @@ fn main() -> Result<()> {
         archives.push(path);
     }
 
-    report(&rx_stats, &vstats, &aggregator, bad_data);
+    report(&rx_stats, &vstats, &aggregator, &stats, registry.names());
 
     if let Some(tc) = txn_compare {
         tc.finish();
@@ -409,12 +408,13 @@ fn ingest(
     vstats: &mut VerifyStats,
     aggregator: &mut Aggregator,
 ) -> Vec<VerifiedShred> {
+    let verified = verify_chunk(&packets, schedule, shred_version, vstats);
     if let Some(tc) = txn_compare {
-        for p in &packets {
-            tc.feed(p.rx_unix_ns, p.provider, &p.data);
+        for shred in verified.iter().filter(|shred| shred.is_authentic()) {
+            let packet = &packets[shred.packet_index];
+            tc.feed(packet.rx_unix_ns, packet.provider, &packet.data);
         }
     }
-    let verified = verify_chunk(packets, schedule, shred_version, vstats);
     for s in &verified {
         aggregator.ingest(s);
     }
@@ -438,9 +438,15 @@ fn write_txns(tc: &TxnCompare, sink: &mut Sink, stats: &mut WindowStats) -> Resu
     Ok(())
 }
 
-fn report(rx_stats: &RxStats, v: &VerifyStats, agg: &Aggregator, bad_data: u64) {
+fn report(
+    rx_stats: &RxStats,
+    v: &VerifyStats,
+    agg: &Aggregator,
+    stats: &WindowStats,
+    providers: &[String],
+) {
     eprintln!(
-        "rx {} (unmatched {}, no_ts {}, dropped {}, kernel_drop {}, trunc {}) | parsed {} bad_sig {} (data {}) no_leader {} malformed {} ping {} unsupported {} | ed25519 {} (batch_fallback {}) | after_window {} | pending sets {}",
+        "rx {} (unmatched {}, no_ts {}, dropped {}, kernel_drop {}, trunc {}) | parsed {} bad_sig {} (data {}) proof_stripped {} no_leader {} malformed {} ping {} unsupported {} | ed25519 {} (batch_fallback {}) | after_window {} | pending sets {}",
         rx_stats.received.load(Ordering::Relaxed),
         rx_stats.unmatched.load(Ordering::Relaxed),
         rx_stats.no_timestamp.load(Ordering::Relaxed),
@@ -449,7 +455,8 @@ fn report(rx_stats: &RxStats, v: &VerifyStats, agg: &Aggregator, bad_data: u64) 
         rx_stats.truncated.load(Ordering::Relaxed),
         v.parsed,
         v.sig_bad,
-        bad_data,
+        stats.invalid_data,
+        v.proof_stripped,
         v.no_leader,
         v.malformed,
         v.non_shred_ping,
@@ -459,4 +466,22 @@ fn report(rx_stats: &RxStats, v: &VerifyStats, agg: &Aggregator, bad_data: u64) 
         agg.shreds_after_window(),
         agg.pending_sets(),
     );
+    for (id, name) in providers.iter().enumerate() {
+        let p = v.providers.get(id).copied().unwrap_or_default();
+        let invalid = stats.providers.get(id).copied().unwrap_or_default();
+        eprintln!(
+            "  {name}: parsed {} malformed {} wrong_version {} unsupported {} no_merkle_root {} no_leader {} bad_sig {} proof_stripped {} | invalid sig {} data {} unknown {}",
+            p.parsed,
+            p.malformed,
+            p.wrong_version,
+            p.unsupported_variant,
+            p.no_merkle_root,
+            p.no_leader,
+            p.sig_bad,
+            p.proof_stripped,
+            invalid.invalid_sig,
+            invalid.invalid_data,
+            invalid.invalid_unknown,
+        );
+    }
 }
