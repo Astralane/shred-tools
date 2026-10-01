@@ -173,6 +173,8 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let mut last_flush = Instant::now();
     let mut last_report = Instant::now();
+    let mut mixed_warned = std::collections::HashSet::new();
+    let mut last_sender_check = Instant::now();
     let mut last_txn = Instant::now();
     let mut last_rotate = Instant::now();
     let mut last_sched_check = Instant::now();
@@ -285,6 +287,14 @@ fn main() -> Result<()> {
         } else if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();
             report(&rx_stats, &vstats, &aggregator, &stats, registry.names());
+        }
+        if last_sender_check.elapsed() >= Duration::from_secs(10) {
+            last_sender_check = Instant::now();
+            for warning in netmon.mixed_senders(&cfg, &registry) {
+                if mixed_warned.insert(warning.clone()) {
+                    notify(tui.is_some(), &mut footer, format!("warning: {warning}"));
+                }
+            }
         }
 
         if args.live && last_live.elapsed() >= Duration::from_secs(live_secs) {

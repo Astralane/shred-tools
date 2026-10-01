@@ -75,6 +75,30 @@ impl NetMon {
         out
     }
 
+    pub fn mixed_senders(&self, cfg: &Config, registry: &Registry) -> Vec<String> {
+        let observed = self.observed.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, p) in cfg.providers.iter().enumerate() {
+            let Some(ips) = observed.get(&(id as ProviderId)) else { continue };
+            if !p.ips.is_empty() || ips.len() < 2 {
+                continue;
+            }
+            let mut ips: Vec<_> = ips.iter().copied().collect();
+            ips.sort_by_key(|ip| u32::from(*ip));
+            let ips: Vec<String> = ips.iter().map(Ipv4Addr::to_string).collect();
+            out.push(format!(
+                "provider `{}`{} receives shreds from {} source IPs ({}); its numbers mix all of \
+                 them and it wins whenever any of them is first. Add `ips:` to the provider to \
+                 keep only its own sender, and list the others as providers of their own",
+                registry.name(id as ProviderId),
+                p.port.map(|port| format!(" (port {port})")).unwrap_or_default(),
+                ips.len(),
+                ips.join(", ")
+            ));
+        }
+        out
+    }
+
     fn targets(&self, cfg: &Config) -> AHashSet<Ipv4Addr> {
         let mut targets: AHashSet<Ipv4Addr> =
             cfg.providers.iter().flat_map(|p| p.ips.iter().copied()).collect();
@@ -271,5 +295,28 @@ mod tests {
         let targets = NetMon::default().targets(&cfg);
         assert!(targets.contains(&"10.0.0.3".parse().unwrap()));
         assert_eq!(targets.len(), 3, "configured provider ip + two grpc hosts");
+    }
+
+    #[test]
+    fn only_a_port_matched_provider_with_several_senders_is_flagged() {
+        let mut cfg = ping_cfg();
+        cfg.providers.push(crate::config::ProviderCfg {
+            name: "shreds-b".into(),
+            port: Some(20001),
+            ips: vec![],
+        });
+        let registry = Registry::build(&cfg);
+        let netmon = NetMon::default();
+        for ip in ["10.0.0.1", "10.0.0.9"] {
+            netmon.observe(0, ip.parse().unwrap());
+        }
+        netmon.observe(1, "10.0.0.7".parse().unwrap());
+        assert!(netmon.mixed_senders(&cfg, &registry).is_empty());
+
+        netmon.observe(1, "10.0.0.8".parse().unwrap());
+        let warnings = netmon.mixed_senders(&cfg, &registry);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`shreds-b` (port 20001)"), "{}", warnings[0]);
+        assert!(warnings[0].contains("10.0.0.7, 10.0.0.8"), "{}", warnings[0]);
     }
 }

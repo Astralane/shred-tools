@@ -99,14 +99,14 @@
   "panels": [
     {
       "type": "table",
-      "title": "Errors and RPC coverage — over the selected range",
-      "description": "One row per check. `error %` is errors / checked. `slots verified against RPC %` is the share of all slots produced in the range (about one per 400 ms) whose block was fetched with getBlock and compared; the onchain audit samples one slot every few seconds and the filter audit every Nth slot, so 100% is never the target, but a value near 0 means the RPC is failing (see the getBlock row) and nothing is being verified.",
+      "title": "Health summary — what was tested and how much of it failed",
+      "description": "One row per check over the selected time range.\n\n• in range — all data of that unit in the range (shreds received, shreds expected, slots produced ≈ one per 400 ms, getBlock calls).\n• tested — how much of it was actually checked; tested % = tested / in range.\n• errors / error % — failures among what was tested.\n\n1. Shreds: every UDP shred is checked against the leader's signature (shreds whose slot leader is unknown are not tested); 'not forged' fails on a real signature mismatch, 'Merkle proof present' fails when a relay zeroed the proof; 'delivered' compares each provider's FEC sets with what the leader produced.\n2. Deshred: transactions this tool rebuilt from each shred provider's shreds, compared signature-by-signature with getBlock on sampled slots; error % is missed + corrupted + duplicated transactions over the block's transactions.\n3. gRPC feeds: non-rotating deshred feeds are checked like 2; rotating feeds are checked per filter by the filter audit instead.\n4. RPC: every getBlock behind 2 and 3. A low tested % in 2 or 3 with errors here means the RPC is the bottleneck.\n\nWith a Shyft RPC, getBlock carries no votes, so 2 and 3 compare non-vote transactions only.",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "shredaudit-pg"
       },
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 24,
         "x": 0,
         "y": 0
@@ -122,7 +122,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "table",
-          "rawSql": "WITH\nslots AS (SELECT GREATEST(($__unixEpochTo() - $__unixEpochFrom()) / 0.4, 1) AS n),\ncounters AS (\n  SELECT COALESCE(SUM(value) FILTER (WHERE name = 'shreds_parsed'), 0) AS parsed,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_sig_bad'), 0) AS sig_bad,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_proof_stripped'), 0) AS stripped\n  FROM audit_counters WHERE $__timeFilter(ts) AND host = '$host'),\ndelivery AS (\n  SELECT COALESCE(SUM(shreds_data + shreds_code + missed), 0) AS expected,\n         COALESCE(SUM(missed), 0) AS missed\n  FROM provider_stats WHERE $__timeFilter(ts) AND host = '$host'),\nonchain_rows AS (\n  SELECT source, onchain_txns, onchain_bad, onchain_slots_checked,\n         onchain_txns - LAG(onchain_txns) OVER w AS d_txns,\n         onchain_bad - LAG(onchain_bad) OVER w AS d_bad,\n         onchain_slots_checked - LAG(onchain_slots_checked) OVER w AS d_slots\n  FROM txn_source_stats WHERE $__timeFilter(ts) AND host = '$host'\n  WINDOW w AS (PARTITION BY source ORDER BY ts)),\nonchain_by_source AS (\n  SELECT source,\n         SUM(CASE WHEN d_txns < 0 THEN onchain_txns ELSE COALESCE(d_txns, 0) END) AS txns,\n         SUM(CASE WHEN d_bad < 0 THEN onchain_bad ELSE COALESCE(d_bad, 0) END) AS bad,\n         SUM(CASE WHEN d_slots < 0 THEN onchain_slots_checked ELSE COALESCE(d_slots, 0) END) AS slots\n  FROM onchain_rows GROUP BY source),\nonchain AS (\n  SELECT COALESCE(SUM(txns), 0) AS txns, COALESCE(SUM(bad), 0) AS bad, COALESCE(MAX(slots), 0) AS slots\n  FROM onchain_by_source),\nfilters AS (\n  SELECT COALESCE(SUM(expected), 0) AS expected,\n         COALESCE(SUM(missed + extra_in_block), 0) AS errors,\n         COALESCE(MAX(slots), 0) AS slots\n  FROM (SELECT source, SUM(expected) AS expected, SUM(missed) AS missed,\n               SUM(extra_in_block) AS extra_in_block, SUM(slots_checked) AS slots\n        FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host'\n        GROUP BY source) per_source),\nrpc AS (\n  SELECT COUNT(*) AS calls, COUNT(*) FILTER (WHERE status <> 'ok') AS failed\n  FROM rpc_block_fetches WHERE $__timeFilter(ts) AND host = '$host')\nSELECT * FROM (\n  SELECT 1 AS ord, 'Shreds: bad signature (forged)' AS \"check\", parsed AS checked, sig_bad AS errors,\n         100.0 * sig_bad / NULLIF(parsed, 0) AS \"error %\", NULL::float AS \"slots verified against RPC %\" FROM counters\n  UNION ALL SELECT 2, 'Shreds: Merkle proof stripped', parsed, stripped,\n         100.0 * stripped / NULLIF(parsed, 0), NULL FROM counters\n  UNION ALL SELECT 3, 'Shreds: missed (never delivered)', expected, missed,\n         100.0 * missed / NULLIF(expected, 0), NULL FROM delivery\n  UNION ALL SELECT 4, 'Transactions vs chain (onchain audit)', txns, bad,\n         100.0 * bad / NULLIF(txns, 0), 100.0 * slots / slots.n FROM onchain, slots\n  UNION ALL SELECT 5, 'gRPC filters vs chain (filter audit)', expected, errors,\n         100.0 * errors / NULLIF(expected, 0), 100.0 * filters.slots / slots.n FROM filters, slots\n  UNION ALL SELECT 6, 'RPC getBlock calls', calls, failed,\n         100.0 * failed / NULLIF(calls, 0), NULL FROM rpc\n) summary ORDER BY ord"
+          "rawSql": "WITH\nslots AS (SELECT GREATEST(($__unixEpochTo() - $__unixEpochFrom()) / 0.4, 1)::bigint AS n),\ncounters AS (\n  SELECT COALESCE(SUM(value) FILTER (WHERE name = 'shreds_parsed'), 0) AS parsed,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_no_leader'), 0) AS no_leader,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_sig_bad'), 0) AS sig_bad,\n         COALESCE(SUM(value) FILTER (WHERE name = 'shreds_proof_stripped'), 0) AS stripped\n  FROM audit_counters WHERE $__timeFilter(ts) AND host = '$host'),\ndelivery AS (\n  SELECT COALESCE(SUM(shreds_data + shreds_code + missed), 0) AS expected,\n         COALESCE(SUM(missed), 0) AS missed\n  FROM provider_stats WHERE $__timeFilter(ts) AND host = '$host'),\nonchain_rows AS (\n  SELECT source, kind, onchain_txns, onchain_bad, onchain_slots_checked,\n         onchain_txns - LAG(onchain_txns) OVER w AS d_txns,\n         onchain_bad - LAG(onchain_bad) OVER w AS d_bad,\n         onchain_slots_checked - LAG(onchain_slots_checked) OVER w AS d_slots\n  FROM txn_source_stats WHERE $__timeFilter(ts) AND host = '$host'\n  WINDOW w AS (PARTITION BY source ORDER BY ts)),\nonchain_by_source AS (\n  SELECT source, kind,\n         SUM(CASE WHEN d_txns < 0 THEN onchain_txns ELSE COALESCE(d_txns, 0) END) AS txns,\n         SUM(CASE WHEN d_bad < 0 THEN onchain_bad ELSE COALESCE(d_bad, 0) END) AS bad,\n         SUM(CASE WHEN d_slots < 0 THEN onchain_slots_checked ELSE COALESCE(d_slots, 0) END) AS slots\n  FROM onchain_rows GROUP BY source, kind),\nonchain AS (\n  SELECT k.kind, COALESCE(SUM(o.txns), 0) AS txns, COALESCE(SUM(o.bad), 0) AS bad,\n         COALESCE(MAX(o.slots), 0) AS slots\n  FROM (VALUES ('shreds'), ('grpc-deshred')) AS k(kind)\n  LEFT JOIN onchain_by_source o ON o.kind = k.kind\n  GROUP BY k.kind),\nfilters AS (\n  SELECT COALESCE(SUM(expected), 0) AS expected,\n         COALESCE(SUM(missed + extra_in_block), 0) AS errors,\n         COALESCE(MAX(slots), 0) AS slots\n  FROM (SELECT source, SUM(expected) AS expected, SUM(missed) AS missed,\n               SUM(extra_in_block) AS extra_in_block, SUM(slots_checked) AS slots\n        FROM filter_windows WHERE $__timeFilter(ended_at) AND host = '$host'\n        GROUP BY source) per_source),\nrpc AS (\n  SELECT COUNT(*) AS calls, COUNT(*) FILTER (WHERE status <> 'ok') AS failed\n  FROM rpc_block_fetches WHERE $__timeFilter(ts) AND host = '$host')\nSELECT area, \"check\", unit, \"in range\", tested,\n       100.0 * tested / NULLIF(\"in range\", 0) AS \"tested %\",\n       errors, 100.0 * errors / NULLIF(error_base, 0) AS \"error %\"\nFROM (\n  SELECT 1 AS ord, '1. Shreds (raw UDP)' AS area, 'signature valid — not forged' AS \"check\", 'shreds' AS unit,\n         parsed AS \"in range\", parsed - no_leader AS tested, sig_bad AS errors, parsed - no_leader AS error_base\n  FROM counters\n  UNION ALL SELECT 2, '1. Shreds (raw UDP)', 'Merkle proof present — not stripped', 'shreds',\n         parsed, parsed - no_leader, stripped, parsed - no_leader FROM counters\n  UNION ALL SELECT 3, '1. Shreds (raw UDP)', 'delivered — not missed', 'shreds',\n         expected, expected, missed, expected FROM delivery\n  UNION ALL SELECT 4, '2. Deshred (txs rebuilt from shreds)', 'match the confirmed block (onchain audit)', 'slots',\n         slots.n, onchain.slots, onchain.bad, onchain.txns FROM onchain, slots WHERE onchain.kind = 'shreds'\n  UNION ALL SELECT 5, '3. gRPC feeds', 'deshred feed matches the block (onchain audit)', 'slots',\n         slots.n, onchain.slots, onchain.bad, onchain.txns FROM onchain, slots WHERE onchain.kind = 'grpc-deshred'\n  UNION ALL SELECT 6, '3. gRPC feeds', 'filtered deliveries match the block (filter audit)', 'slots',\n         slots.n, filters.slots, filters.errors, filters.expected FROM filters, slots\n  UNION ALL SELECT 7, '4. RPC', 'getBlock calls succeeded', 'calls',\n         calls, calls, failed, calls FROM rpc\n) summary ORDER BY ord"
         }
       ],
       "options": {
@@ -146,12 +146,12 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "ord"
+              "options": "area"
             },
             "properties": [
               {
-                "id": "custom.hidden",
-                "value": true
+                "id": "custom.width",
+                "value": 260
               }
             ]
           },
@@ -163,14 +163,38 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 320
+                "value": 380
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "checked"
+              "options": "unit"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "in range"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tested"
             },
             "properties": [
               {
@@ -188,6 +212,49 @@
               {
                 "id": "unit",
                 "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "tested %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 2
+                    },
+                    {
+                      "color": "green",
+                      "value": 5
+                    }
+                  ]
+                }
               }
             ]
           },
@@ -227,49 +294,6 @@
                     {
                       "color": "red",
                       "value": 1
-                    }
-                  ]
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "slots verified against RPC %"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percent"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-background",
-                  "mode": "basic"
-                }
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "yellow",
-                      "value": 2
-                    },
-                    {
-                      "color": "green",
-                      "value": 5
                     }
                   ]
                 }

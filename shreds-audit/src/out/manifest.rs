@@ -220,6 +220,7 @@ pub fn build_manifest(
             "{unmatched} datagrams matched no provider rule and were ignored"
         ));
     }
+    notes.extend(netmon.mixed_senders(cfg, registry));
     if shreds_after_window > 0 {
         notes.push(format!(
             "{shreds_after_window} shreds arrived for FEC sets that had already been finalized \

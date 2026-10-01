@@ -186,10 +186,19 @@ providers:
     port: 20001                # match anything arriving on this port
   - name: beta
     ips: ["203.0.113.7"]       # or match by the source IP it sends from
+  - name: gamma
+    port: 20002
+    ips: ["203.0.113.8"]       # or both: only this sender on this port
 
 output_dir: "./out"            # where reports are written
 rotate_secs: 600               # start a fresh report every N seconds (0 = one at exit)
 ```
+
+Match by port alone only when the port has a single sender. If several machines
+send to one port (a relay fanning out the same stream, say), a port-only provider
+mixes them all and wins whenever any of them is first; the tool warns about it in
+the log and the manifest notes, naming the IPs. Add `ips:` to keep only the
+provider's own sender, and list the other senders as providers of their own.
 
 Each provider must set `port`, `ips`, or both — the tool refuses to start on a
 config that could silently drop traffic, so you find mistakes immediately rather
