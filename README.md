@@ -11,6 +11,10 @@ Tooling for measuring and monitoring Solana shred-source performance.
   leader-schedule populator) that renders the **Providers monitoring** dashboard.
   Built on mainline agave crates.
 
+- **[`postpack-health/`](postpack-health/)** — a service that continuously races the
+  postpack feed against decoded shreds on one host's clock and alerts Slack when the
+  postpack lead degrades. Reads `shred_indexer.*` on the XL cluster; writes nothing.
+
 - **[`perf-report/`](perf-report/)** — offline analysis scripts that pull
   competition data from the metrics DB, join it with the live leader schedule,
   and build xlsx reports (general, per-provider, per-leader, signature-valid).
