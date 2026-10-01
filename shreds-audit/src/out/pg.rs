@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(deltas["shreds_parsed"], 40);
         assert_eq!(
             deltas.len(),
-            21,
+            25,
             "every field of Counters must reach the database; add one and this moves"
         );
     }

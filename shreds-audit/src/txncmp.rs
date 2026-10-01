@@ -244,6 +244,7 @@ fn build_snapshot(
         .collect();
     TxnCompareSummary {
         distinct_signatures: reg.distinct_signatures(),
+        tx_versions: reg.tx_versions(),
         contested: reg.contested_signatures(),
         sources,
         onchain_slots_checked: audit.slots_checked,

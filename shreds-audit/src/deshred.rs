@@ -6,7 +6,7 @@ use std::{
 use bytes::Bytes;
 use crossbeam_channel::Receiver;
 
-use crate::sigreg::{is_simple_vote, SigRegistry, TxnMeta};
+use crate::sigreg::{is_simple_vote, SigRegistry, TxVersion, TxnMeta};
 
 pub struct ShredInput {
     pub rx_unix_ns: i64,
@@ -47,13 +47,24 @@ impl Deshredder {
                 let Some(sig) = ::deshred::first_signature(tx) else {
                     continue;
                 };
+                let is_vote = is_vote(tx);
                 let meta = TxnMeta {
-                    is_vote: Some(is_vote(tx)),
+                    is_vote: Some(is_vote),
+                    version: Some(version(tx, is_vote)),
                     ..TxnMeta::default()
                 };
                 reg.record_first(input.provider as usize, sig, input.rx_unix_ns, set.slot, meta);
             }
         }
+    }
+}
+
+fn version(tx: &::deshred::VersionedTransaction, is_vote: bool) -> TxVersion {
+    match &tx.message {
+        ::deshred::VersionedMessage::Legacy(_) if is_vote => TxVersion::Vote,
+        ::deshred::VersionedMessage::Legacy(_) => TxVersion::Legacy,
+        ::deshred::VersionedMessage::V0(_) => TxVersion::V0,
+        ::deshred::VersionedMessage::V1(_) => TxVersion::V1,
     }
 }
 

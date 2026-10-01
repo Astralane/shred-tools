@@ -49,8 +49,36 @@ pub fn is_simple_vote(
     signatures < 3 && legacy && instructions == 1 && program_id == Some(&VOTE_PROGRAM_ID[..])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxVersion {
+    Vote,
+    Legacy,
+    V0,
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TxVersionCounts {
+    pub vote: u64,
+    pub legacy: u64,
+    pub v0: u64,
+    pub v1: u64,
+}
+
+impl TxVersionCounts {
+    fn add(&mut self, version: TxVersion) {
+        match version {
+            TxVersion::Vote => self.vote += 1,
+            TxVersion::Legacy => self.legacy += 1,
+            TxVersion::V0 => self.v0 += 1,
+            TxVersion::V1 => self.v1 += 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TxnMeta {
+    pub version: Option<TxVersion>,
     pub server_created_at_ns: Option<i64>,
     pub is_vote: Option<bool>,
     pub message_size: Option<u32>,
@@ -80,6 +108,7 @@ struct Seen {
 
 struct SigRow {
     slot: u64,
+    version_counted: bool,
     ts: Vec<Option<Seen>>,
 }
 
@@ -89,6 +118,7 @@ pub struct SigRegistry {
     events: AHashMap<[u8; 64], SigRow>,
     high_slot: u64,
     distinct_total: u64,
+    tx_versions: TxVersionCounts,
     contested_total: u64,
     seen: Vec<u64>,
     contested: Vec<u64>,
@@ -191,6 +221,7 @@ impl SigRegistry {
             events: AHashMap::new(),
             high_slot: 0,
             distinct_total: 0,
+            tx_versions: TxVersionCounts::default(),
             contested_total: 0,
             seen: vec![0; n],
             contested: vec![0; n],
@@ -240,6 +271,10 @@ impl SigRegistry {
         self.distinct_total
     }
 
+    pub fn tx_versions(&self) -> TxVersionCounts {
+        self.tx_versions
+    }
+
     pub fn contested_signatures(&self) -> u64 {
         self.contested_total
     }
@@ -258,9 +293,14 @@ impl SigRegistry {
             self.distinct_total += 1;
             SigRow {
                 slot,
+                version_counted: false,
                 ts: vec![None; n],
             }
         });
+        if let (false, Some(version)) = (row.version_counted, meta.version) {
+            row.version_counted = true;
+            self.tx_versions.add(version);
+        }
         // A source may report slot 0 when it does not know the slot.
         if row.slot == 0 {
             row.slot = slot;
@@ -498,6 +538,7 @@ mod tests {
         let mut r = reg();
         r.enable_txn_rows();
         let meta = TxnMeta {
+            version: None,
             server_created_at_ns: Some(900),
             is_vote: Some(true),
             message_size: Some(215),
@@ -557,5 +598,28 @@ mod tests {
         r.enable_onchain_index(32, false);
         r.record_first(0, sig(1), 1, 100, vote);
         assert!(r.take_onchain_slot(100).is_some());
+    }
+
+    #[test]
+    fn counts_each_signature_once_by_the_first_known_version() {
+        let meta = |version| TxnMeta {
+            version,
+            ..TxnMeta::default()
+        };
+        let mut r = reg();
+        r.record_first(1, sig(1), 1, 100, meta(None));
+        r.record_first(0, sig(1), 2, 100, meta(Some(TxVersion::V1)));
+        r.record_first(1, sig(1), 3, 100, meta(Some(TxVersion::V0)));
+        r.record_first(0, sig(2), 4, 100, meta(Some(TxVersion::Vote)));
+        r.record_first(0, sig(3), 5, 100, meta(Some(TxVersion::V0)));
+        r.record_first(1, sig(4), 6, 100, meta(None));
+
+        let expected = TxVersionCounts {
+            vote: 1,
+            legacy: 0,
+            v0: 1,
+            v1: 1,
+        };
+        assert_eq!(r.tx_versions(), expected);
     }
 }

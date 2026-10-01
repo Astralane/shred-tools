@@ -8,7 +8,7 @@ use crate::{
     pinger::NetMon,
     registry::Registry,
     rx::RxStats,
-    sigreg::SourceKind,
+    sigreg::{SourceKind, TxVersionCounts},
     verify::{ProviderVerifyStats, VerifyStats},
 };
 
@@ -49,6 +49,7 @@ pub struct Manifest {
 #[derive(Serialize, Clone, Default)]
 pub struct TxnCompareSummary {
     pub distinct_signatures: u64,
+    pub tx_versions: TxVersionCounts,
     pub contested: u64,
     pub sources: Vec<TxnSource>,
     pub onchain_slots_checked: u64,
@@ -123,6 +124,10 @@ pub struct Counters {
     pub ed25519_verifies: u64,
     pub batch_fallbacks: u64,
     pub shreds_after_window: u64,
+    pub txs_vote: u64,
+    pub txs_legacy: u64,
+    pub txs_v0: u64,
+    pub txs_v1: u64,
 }
 
 impl Counters {
@@ -131,7 +136,9 @@ impl Counters {
         v: &VerifyStats,
         stats: &WindowStats,
         shreds_after_window: u64,
+        txn: Option<&TxnCompareSummary>,
     ) -> Self {
+        let versions = txn.map(|t| t.tx_versions).unwrap_or_default();
         Self {
             udp_received: rx.received.load(Ordering::Relaxed),
             udp_unmatched: rx.unmatched.load(Ordering::Relaxed),
@@ -154,6 +161,10 @@ impl Counters {
             ed25519_verifies: v.ed25519_verifies,
             batch_fallbacks: v.batch_fallbacks,
             shreds_after_window,
+            txs_vote: versions.vote,
+            txs_legacy: versions.legacy,
+            txs_v0: versions.v0,
+            txs_v1: versions.v1,
         }
     }
 }
@@ -171,7 +182,7 @@ pub fn build_manifest(
     shreds_after_window: u64,
     started_at: i64,
 ) -> Manifest {
-    let counters = Counters::snapshot(rx_stats, vstats, stats, shreds_after_window);
+    let counters = Counters::snapshot(rx_stats, vstats, stats, shreds_after_window, txn);
     let mut notes = Vec::new();
     let no_ts = counters.udp_no_timestamp;
     if no_ts > 0 {

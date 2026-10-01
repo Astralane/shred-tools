@@ -427,6 +427,7 @@ mod tests {
                 first_rx_unix_ns: 111,
                 duplicate_count: 2,
                 meta: TxnMeta {
+                    version: None,
                     server_created_at_ns: Some(99),
                     is_vote: Some(true),
                     message_size: Some(300),

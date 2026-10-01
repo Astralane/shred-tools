@@ -304,6 +304,248 @@
       }
     },
     {
+      "type": "timeseries",
+      "id": 1001,
+      "title": "Transaction versions — share over time",
+      "description": "Every distinct transaction this tool rebuilt from the shred providers' shreds, counted once by message version (votes split out of legacy). Stacked to 100%: each band is that version's share at that time. Transactions only seen on a gRPC feed are not counted: the Yellowstone protobuf cannot tell v1 from v0.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS time,\n       CASE name\n         WHEN 'txs_vote' THEN 'legacy — vote'\n         WHEN 'txs_legacy' THEN 'legacy — non-vote'\n         WHEN 'txs_v0' THEN 'v0'\n         WHEN 'txs_v1' THEN 'v1'\n       END AS metric,\n       value::float AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('txs_vote', 'txs_legacy', 'txs_v0', 'txs_v1')\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "percent",
+              "group": "A"
+            }
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "legacy — vote"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8e8e8e"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "legacy — non-vote"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "v0"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "v1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "piechart",
+      "id": 1002,
+      "title": "Transaction versions — over the range",
+      "description": "Total distinct transactions per message version over the selected range, with each version's share.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shredaudit-pg"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shredaudit-pg"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS time,\n       CASE name\n         WHEN 'txs_vote' THEN 'legacy — vote'\n         WHEN 'txs_legacy' THEN 'legacy — non-vote'\n         WHEN 'txs_v0' THEN 'v0'\n         WHEN 'txs_v1' THEN 'v1'\n       END AS metric,\n       value::float AS value\nFROM audit_counters\nWHERE $__timeFilter(ts) AND host = '$host'\n  AND name IN ('txs_vote', 'txs_legacy', 'txs_v0', 'txs_v1')\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "legacy — vote"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8e8e8e"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "legacy — non-vote"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "v0"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "v1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "displayLabels": [
+          "percent"
+        ]
+      }
+    },
+    {
       "id": 1,
       "type": "timeseries",
       "title": "Clean set rate — every shred in the set verified",
@@ -489,7 +731,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 24,
         "w": 12,
         "h": 7
       },
@@ -549,7 +791,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 23,
+        "y": 31,
         "w": 24,
         "h": 7
       },
@@ -612,7 +854,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 16,
+        "y": 24,
         "w": 12,
         "h": 7
       },
@@ -671,7 +913,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 30,
+        "y": 38,
         "w": 8,
         "h": 7
       },
@@ -730,7 +972,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 30,
+        "y": 38,
         "w": 8,
         "h": 7
       },
@@ -787,7 +1029,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 30,
+        "y": 38,
         "w": 8,
         "h": 7
       },
@@ -844,7 +1086,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 37,
+        "y": 45,
         "w": 12,
         "h": 7
       },
@@ -901,7 +1143,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 37,
+        "y": 45,
         "w": 12,
         "h": 7
       },
@@ -958,7 +1200,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 52,
         "w": 12,
         "h": 7
       },
@@ -1015,7 +1257,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 44,
+        "y": 52,
         "w": 12,
         "h": 7
       },
@@ -1072,7 +1314,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 59,
         "w": 12,
         "h": 7
       },
@@ -1129,7 +1371,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 51,
+        "y": 59,
         "w": 12,
         "h": 7
       },
@@ -1187,7 +1429,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 58,
+        "y": 66,
         "w": 24,
         "h": 7
       },
@@ -1244,7 +1486,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 73,
         "w": 24,
         "h": 8
       },
@@ -1290,7 +1532,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 73,
+        "y": 81,
         "w": 24,
         "h": 1
       },
@@ -1306,7 +1548,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 74,
+            "y": 82,
             "w": 6,
             "h": 4
           },
@@ -1369,7 +1611,7 @@
           },
           "gridPos": {
             "x": 6,
-            "y": 74,
+            "y": 82,
             "w": 6,
             "h": 4
           },
@@ -1432,7 +1674,7 @@
           },
           "gridPos": {
             "x": 12,
-            "y": 74,
+            "y": 82,
             "w": 6,
             "h": 4
           },
@@ -1499,7 +1741,7 @@
           },
           "gridPos": {
             "x": 18,
-            "y": 74,
+            "y": 82,
             "w": 6,
             "h": 4
           },
@@ -1562,7 +1804,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 78,
+            "y": 86,
             "w": 12,
             "h": 8
           },
@@ -1623,7 +1865,7 @@
           },
           "gridPos": {
             "x": 12,
-            "y": 78,
+            "y": 86,
             "w": 12,
             "h": 8
           },
@@ -1684,7 +1926,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 86,
+            "y": 94,
             "w": 12,
             "h": 8
           },
@@ -1745,7 +1987,7 @@
           },
           "gridPos": {
             "x": 12,
-            "y": 86,
+            "y": 94,
             "w": 12,
             "h": 8
           },
@@ -1806,7 +2048,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 94,
+            "y": 102,
             "w": 24,
             "h": 9
           },
@@ -1848,7 +2090,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 103,
+            "y": 111,
             "w": 24,
             "h": 10
           },
@@ -1888,7 +2130,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 82,
         "w": 24,
         "h": 1
       },
@@ -1904,7 +2146,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 75,
+            "y": 83,
             "w": 24,
             "h": 10
           },
@@ -1946,7 +2188,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 85,
+            "y": 93,
             "w": 8,
             "h": 8
           },
@@ -2008,7 +2250,7 @@
           },
           "gridPos": {
             "x": 8,
-            "y": 85,
+            "y": 93,
             "w": 8,
             "h": 8
           },
@@ -2069,7 +2311,7 @@
           },
           "gridPos": {
             "x": 16,
-            "y": 85,
+            "y": 93,
             "w": 8,
             "h": 8
           },
@@ -2130,7 +2372,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 93,
+            "y": 101,
             "w": 12,
             "h": 8
           },
@@ -2191,7 +2433,7 @@
           },
           "gridPos": {
             "x": 12,
-            "y": 93,
+            "y": 101,
             "w": 12,
             "h": 8
           },
@@ -2250,7 +2492,7 @@
       "collapsed": true,
       "gridPos": {
         "x": 0,
-        "y": 75,
+        "y": 83,
         "w": 24,
         "h": 1
       },
@@ -2266,7 +2508,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 76,
+            "y": 84,
             "w": 12,
             "h": 8
           },
@@ -2325,7 +2567,7 @@
           },
           "gridPos": {
             "x": 12,
-            "y": 76,
+            "y": 84,
             "w": 12,
             "h": 8
           },
@@ -2384,7 +2626,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 84,
+            "y": 92,
             "w": 8,
             "h": 8
           },
@@ -2445,7 +2687,7 @@
           },
           "gridPos": {
             "x": 8,
-            "y": 84,
+            "y": 92,
             "w": 8,
             "h": 8
           },
@@ -2506,7 +2748,7 @@
           },
           "gridPos": {
             "x": 16,
-            "y": 84,
+            "y": 92,
             "w": 8,
             "h": 8
           },
@@ -2567,7 +2809,7 @@
           },
           "gridPos": {
             "x": 0,
-            "y": 92,
+            "y": 100,
             "w": 24,
             "h": 9
           },

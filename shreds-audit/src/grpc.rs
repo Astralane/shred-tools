@@ -291,6 +291,7 @@ fn hit(
     let meta = TxnMeta {
         server_created_at_ns: created_at_ns,
         is_vote: Some(is_vote),
+        version: None,
         message_size: Some(tx.encoded_len() as u32),
         connection_id: Some(connection_id),
     };
