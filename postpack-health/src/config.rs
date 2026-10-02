@@ -27,6 +27,8 @@ pub struct Config {
     pub late_ms_threshold: u64,
     #[serde(default = "default_late_rate_threshold")]
     pub late_rate_threshold: f64,
+    #[serde(default = "default_recovery_late_rate")]
+    pub recovery_late_rate: f64,
     #[serde(default = "default_repeat_alert_secs")]
     pub repeat_alert_secs: u64,
     #[serde(default = "default_no_data_alert_after_secs")]
@@ -65,7 +67,7 @@ fn default_database() -> String {
 }
 
 fn default_poll_interval_secs() -> u64 {
-    60
+    180
 }
 
 fn default_window_secs() -> u64 {
@@ -94,6 +96,10 @@ fn default_late_ms_threshold() -> u64 {
 
 fn default_late_rate_threshold() -> f64 {
     0.10
+}
+
+fn default_recovery_late_rate() -> f64 {
+    0.08
 }
 
 fn default_repeat_alert_secs() -> u64 {

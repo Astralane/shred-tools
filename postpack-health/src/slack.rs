@@ -50,6 +50,15 @@ pub fn payload(alert: &Alert) -> Value {
                 pairs
             ),
         }),
+        Alert::DataRestored { pairs, win_rate } => json!({
+            "icon_emoji": ":white_check_mark:",
+            "username": "postpack-degradation-bot",
+            "text": format!(
+                ":white_check_mark: *Postpack comparison data is flowing again*\nLast window matched {} pairs at a {:.1}% win rate.",
+                pairs,
+                win_rate * 100.0
+            ),
+        }),
         Alert::NoData { minutes, pairs } => json!({
             "icon_emoji": ":warning:",
             "username": "postpack-degradation-bot",

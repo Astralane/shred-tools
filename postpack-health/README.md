@@ -29,18 +29,19 @@ skew correction.
 ## Alerting
 
 A window breaches when **either** the win rate falls below 85% **or** more than 10% of
-pairs are over 100 ms late. Recovery is announced once the win rate reaches 90%, so a
-feed hovering at the threshold does not flap. While degraded, repeats are throttled to
-one every 15 minutes.
+pairs are over 100 ms late. Recovery requires **both** the win rate at 90% or above
+**and** the late rate at or below 8%, so a breach caused by tail lag cannot clear on
+win-rate alone and flap on fractions of a percent. While degraded, repeats are throttled
+to one every 15 minutes.
 
 Those numbers come from measured baselines rather than taste:
 
-| host | pairs | win rate | p50 | p90 | late >100 ms |
-|---|---|---|---|---|---|
-| ny | 357 | 98.3% | +186 ms | +618 ms | 6 (1.7%) |
-| ny | 691 | 94.1% | +139 ms | +451 ms | 29 (4.2%) |
-| longhorn-lt | 862 | 94.3% | +98 ms | +472 ms | 36 (4.2%) |
-| longhorn-lt | 156 | 98.7% | +53 ms | +175 ms | 0 |
+| cluster | host | pairs | win rate | p50 | p90 | late >100 ms |
+|---|---|---|---|---|---|---|
+| terra | limburg | 1766 | 98.3% | +139 ms | +770 ms | 13 (0.7%) |
+| terra | limburg | 1606 | 98.2% | +128 ms | +914 ms | 13 (0.8%) |
+| new-longhorn | ny | 691 | 94.1% | +139 ms | +451 ms | 29 (4.2%) |
+| new-longhorn | longhorn-lt | 862 | 94.3% | +98 ms | +472 ms | 36 (4.2%) |
 
 The tail rule is a **rate**, not a count: a baseline window already carries 6–36 late
 pairs, so any small absolute threshold fires continuously.
@@ -52,9 +53,25 @@ pairs, so any small absolute threshold fires continuously.
   window is 15 minutes, and below `min_pairs` matched pairs the verdict is withheld
   instead of being drawn from a handful of samples. If the window stays empty for 30
   minutes, that itself raises an alert, because a dead pipeline and a healthy one both
-  look like silence.
+  look like silence. That warning then repeats on the same cadence as a degradation
+  alert rather than firing once and going quiet, and a notice is sent when pairs start
+  matching again.
 - **A failing query reading as healthy.** A ClickHouse error is surfaced as an error, not
   parsed as a window with no breaches.
+
+## Which cluster
+
+`shred_indexer.*` exists on two clusters and they are not equivalent:
+
+| cluster | disk | hosts | state |
+|---|---|---|---|
+| terra (`100.95.71.49:18123`) | NVMe | `limburg` | live, streaming to the current minute |
+| new-longhorn (`:18123`) | JBOD HDD | `longhorn-lt`, `ny` | archival batch copies; the `limburg` copy stopped 2026-08-23 |
+
+Point this at **terra**. `relay_arrivals` is ordered by `(sig, recv_ns)`, so a time-range
+filter cannot seek and has to scan the partitions it is given; on spinning disk that is
+16–25 s per evaluation, and at a 60 s poll it never stops reading. On terra, with the
+partition filter derived from the window bounds, the same query is ~1.5 s.
 
 ## Run
 
@@ -71,8 +88,7 @@ postpack window: 862 pairs, win rate 94.3%, p50 97.9ms, p90 471.7ms, 36 late (4.
 
 ## Scope
 
-This measures **our** vantage point — the indexer's subscription on `ny` /
-`longhorn-lt`. A searcher subscribing from their own datacentre sees a different number;
+This measures **our** vantage point — the indexer's subscription on `limburg`. A searcher subscribing from their own datacentre sees a different number;
 during the report that prompted this service, our internal view was 94–99% while theirs
 was 76%. This catches our pipeline degrading. It is not a proxy for what a customer
 experiences, and it will not reproduce their figure.

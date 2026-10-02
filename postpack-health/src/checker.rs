@@ -48,6 +48,10 @@ pub enum Alert {
         minutes: u64,
         pairs: u64,
     },
+    DataRestored {
+        pairs: u64,
+        win_rate: f64,
+    },
 }
 
 pub struct Checker {
@@ -57,6 +61,7 @@ pub struct Checker {
     last_alert: Option<Instant>,
     empty_since: Option<Instant>,
     no_data_alerted: bool,
+    last_no_data_alert: Option<Instant>,
 }
 
 impl Checker {
@@ -68,6 +73,7 @@ impl Checker {
             last_alert: None,
             empty_since: None,
             no_data_alerted: false,
+            last_no_data_alert: None,
         }
     }
 
@@ -142,7 +148,8 @@ WITH
     (
         SELECT sig, min(recv_ns) AS relay_ns
         FROM {db}.relay_arrivals
-        WHERE day >= today() - 1
+        WHERE day >= toDate(intDiv(t0, 1000000000))
+          AND day <= toDate(intDiv(t1, 1000000000))
           AND recv_ns >= t0
           AND recv_ns <  t1
           {ra_host}
@@ -155,7 +162,8 @@ WITH
         FROM {db}.tx_shreds AS t
         INNER JOIN {db}.fec_arrivals AS f
             ON f.slot = t.slot AND f.fec_set_index = t.fec_set_index AND f.host = t.host
-        WHERE t.day >= today() - 1
+        WHERE t.day >= toDate(intDiv(t0, 1000000000))
+          AND t.day <= toDate(intDiv(t1 + {lookahead_ns}, 1000000000))
           {tx_host}
           AND t.sig IN (SELECT sig FROM ra)
           AND f.first_shred_ns >= t0 - 60000000000
@@ -191,8 +199,10 @@ FROM
         if stats.pairs < self.config.min_pairs {
             return self.handle_thin_window(stats.pairs);
         }
+        let was_blind = self.no_data_alerted;
         self.empty_since = None;
         self.no_data_alerted = false;
+        self.last_no_data_alert = None;
 
         let win_rate = stats.win_rate();
         let late_rate = stats.late_count as f64 / stats.pairs as f64;
@@ -234,13 +244,23 @@ FROM
             return None;
         }
 
-        if self.degraded && win_rate >= self.config.recovery_win_rate {
+        if self.degraded
+            && win_rate >= self.config.recovery_win_rate
+            && late_rate <= self.config.recovery_late_rate
+        {
             self.degraded = false;
             self.last_alert = None;
             return Some(Alert::Recovered {
                 win_rate,
                 pairs: stats.pairs,
                 window_secs: self.config.window_secs,
+            });
+        }
+
+        if was_blind {
+            return Some(Alert::DataRestored {
+                pairs: stats.pairs,
+                win_rate,
             });
         }
         None
@@ -252,16 +272,22 @@ FROM
             pairs, self.config.min_pairs
         );
         let since = *self.empty_since.get_or_insert_with(Instant::now);
-        if !self.no_data_alerted
-            && since.elapsed() >= Duration::from_secs(self.config.no_data_alert_after_secs)
-        {
-            self.no_data_alerted = true;
-            return Some(Alert::NoData {
-                minutes: since.elapsed().as_secs() / 60,
-                pairs,
-            });
+        if since.elapsed() < Duration::from_secs(self.config.no_data_alert_after_secs) {
+            return None;
         }
-        None
+        let due = match self.last_no_data_alert {
+            None => true,
+            Some(at) => at.elapsed() >= Duration::from_secs(self.config.repeat_alert_secs),
+        };
+        if !due {
+            return None;
+        }
+        self.no_data_alerted = true;
+        self.last_no_data_alert = Some(Instant::now());
+        Some(Alert::NoData {
+            minutes: since.elapsed().as_secs() / 60,
+            pairs,
+        })
     }
 }
 
@@ -289,6 +315,7 @@ mod tests {
             recovery_win_rate: 0.90,
             late_ms_threshold: 100,
             late_rate_threshold: 0.10,
+            recovery_late_rate: 0.08,
             repeat_alert_secs: 900,
             no_data_alert_after_secs: 1800,
             land_lookahead_secs: 120,
@@ -347,6 +374,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_lag_breach_does_not_recover_on_the_win_rate_alone() {
+        let mut svc = checker();
+        assert!(matches!(
+            svc.evaluate(stats(1000, 940, 120)),
+            Some(Alert::Degraded { .. })
+        ));
+        assert!(svc.evaluate(stats(1000, 940, 99)).is_none());
+        assert!(svc.degraded);
+        assert!(matches!(
+            svc.evaluate(stats(1000, 940, 70)),
+            Some(Alert::Recovered { .. })
+        ));
+    }
+
+    #[test]
+    fn a_blind_checker_keeps_warning_and_announces_when_data_returns() {
+        let mut svc = checker();
+        svc.config.no_data_alert_after_secs = 0;
+        svc.config.repeat_alert_secs = 0;
+
+        assert!(matches!(
+            svc.evaluate(stats(0, 0, 0)),
+            Some(Alert::NoData { .. })
+        ));
+        assert!(matches!(
+            svc.evaluate(stats(0, 0, 0)),
+            Some(Alert::NoData { .. })
+        ));
+        assert!(matches!(
+            svc.evaluate(stats(900, 880, 0)),
+            Some(Alert::DataRestored { .. })
+        ));
+        assert!(svc.evaluate(stats(900, 880, 0)).is_none());
+    }
+
+    #[test]
     fn a_thin_window_never_flips_the_verdict() {
         let mut svc = checker();
         svc.evaluate(stats(1000, 760, 0));
@@ -363,6 +426,8 @@ mod tests {
         assert!(sql.contains("endpoint IN ('64.130.45.19:30001')"));
         assert!(sql.contains("AND t.host = 'ny'"));
         assert!(sql.contains("t1 + 120000000000"));
+        assert!(sql.contains("day >= toDate(intDiv(t0, 1000000000))"));
+        assert!(!sql.contains("today() - 1"));
         assert!(sql.contains("countIf(lead_ms < -100)"));
         assert!(!sql.contains("validator_packet_events"));
     }
