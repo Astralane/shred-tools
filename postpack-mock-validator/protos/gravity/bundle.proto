@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package bundle;
+
+import "packet.proto";
+import "shared.proto";
+
+message Bundle {
+  shared.Header header = 2;
+  repeated packet.Packet packets = 3;
+  repeated uint32 dropping_indices = 4;
+  optional uint64 slot = 5;
+  repeated bytes target_accounts = 6;
+}
+
+message JitoBundle {
+  shared.Header header = 1;
+  // 32-byte identity of the connector that sent this bundle
+  bytes identity_address = 2;
+  // 32-byte identifier of the bundle
+  bytes bundle_id = 3;
+  repeated packet.Packet packets = 4;
+}

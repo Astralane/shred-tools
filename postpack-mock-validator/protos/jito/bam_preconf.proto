@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package bam_preconf;
+
+message PreconfUpdate {
+  uint64 slot = 1;
+  uint32 sequence_id = 2;
+  uint32 bundle_position = 3;
+  bool is_revert_on_error = 4;
+  bytes transaction = 5;
+}
+
+message PreconfSubscribeRequest {
+  uint64 signed_slot = 1;
+  bytes signature = 2;
+}
+
+service PreconfStream {
+  rpc Subscribe(PreconfSubscribeRequest) returns (stream PreconfUpdate);
+}

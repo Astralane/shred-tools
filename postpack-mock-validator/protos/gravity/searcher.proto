@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package searcher;
+
+import "bundle.proto";
+import "packet.proto";
+
+message SendBundleRequest {
+  bundle.Bundle bundle = 1;
+}
+
+message SendBundleResponse {
+  string uuid = 1;
+}
+
+message SendBackrunBundleRequest {
+  // The ID supplied with the JitoBundle from SubscribeBundles.
+  bytes target_bundle_id = 1;
+  bundle.Bundle backrun_bundle = 2;
+}
+
+message SendBackrunBundleResponse {
+  string uuid = 1;
+}
+
+message MempoolSubscription {
+  reserved 1;
+  reserved 2;
+  reserved "program_v0_sub";
+  reserved "wla_v0_sub";
+
+  reserved 10;
+  reserved "regions";
+}
+
+message PendingTxNotification {
+  reserved 1;
+  reserved 2;
+  reserved "server_side_ts";
+  reserved "expiration_time";
+
+  repeated packet.Packet transactions = 3;
+  // 32-byte identity of the connector that sent these transactions
+  bytes identity_address = 4;
+}
+
+message BundleSubscription {}
+
+service SearcherService {
+  rpc SendBundle(SendBundleRequest) returns (SendBundleResponse) {}
+  rpc SendBackrunBundle(SendBackrunBundleRequest) returns (SendBackrunBundleResponse) {}
+  rpc SubscribeMempool(MempoolSubscription) returns (stream PendingTxNotification) {}
+  // Transaction signatures are zeroed before bundles are emitted to subscribers
+  rpc SubscribeBundles(BundleSubscription) returns (stream bundle.JitoBundle) {}
+}

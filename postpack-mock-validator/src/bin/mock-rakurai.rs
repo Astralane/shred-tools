@@ -1,83 +1,57 @@
-use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+//! A Rakurai validator running the Astralane patch (`core/src/tpu_relay/tpu_relay_stage.rs`):
+//! it authenticates against the relay and pushes every batch down both
+//! `AstralaneRelayer/StartRelayStream` (as a bundle) and
+//! `BlockEngineRelayer/StartExpiringPacketStream` (as a packet batch).
 
-use bytes::Bytes;
+use std::str::FromStr;
+use std::time::Duration;
+
 use clap::Parser;
-use prost_types::Timestamp;
-use solana_keypair::{Keypair, read_keypair_file};
-use solana_sdk::hash::Hash;
-use solana_sdk::transaction::Transaction;
+use solana_keypair::Keypair;
 use solana_signer::Signer;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
 
-#[allow(dead_code)]
-mod proto {
-    pub mod astralane_relayer {
-        tonic::include_proto!("astralane_relayer");
-    }
-    pub mod auth {
-        tonic::include_proto!("auth");
-    }
-    pub mod block_engine {
-        tonic::include_proto!("block_engine");
-    }
-    pub mod bundle {
-        tonic::include_proto!("bundle");
-    }
-    pub mod packet {
-        tonic::include_proto!("packet");
-    }
-    pub mod shared {
-        tonic::include_proto!("shared");
-    }
-}
-
-use proto::astralane_relayer::astralane_relayer_client::AstralaneRelayerClient;
-use proto::astralane_relayer::{ExpiringBundleBatch, RelayUpdate, relay_update::Msg};
-use proto::auth::auth_service_client::AuthServiceClient;
-use proto::auth::{GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role};
-use proto::block_engine::block_engine_relayer_client::BlockEngineRelayerClient;
-use proto::block_engine::{
+use postpack_mock_validator::proto::jito::astralane_relayer::astralane_relayer_client::AstralaneRelayerClient;
+use postpack_mock_validator::proto::jito::astralane_relayer::{
+    ExpiringBundleBatch, RelayUpdate, relay_update,
+};
+use postpack_mock_validator::proto::jito::auth::auth_service_client::AuthServiceClient;
+use postpack_mock_validator::proto::jito::auth::{
+    GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role,
+};
+use postpack_mock_validator::proto::jito::block_engine::block_engine_relayer_client::BlockEngineRelayerClient;
+use postpack_mock_validator::proto::jito::block_engine::{
     ExpiringPacketBatch, PacketBatchUpdate, StartExpiringPacketStreamResponse, packet_batch_update,
 };
-use proto::bundle::{Bundle, BundleUuid};
-use proto::packet::{Meta, Packet, PacketBatch};
-use proto::shared::Header;
+use postpack_mock_validator::proto::jito::bundle::{Bundle, BundleUuid};
+use postpack_mock_validator::proto::jito::packet::{Meta, Packet, PacketBatch};
+use postpack_mock_validator::proto::jito::shared::Header;
+use postpack_mock_validator::{Batch, Feed, FeedArgs};
 
 #[derive(Parser)]
-#[command(name = "postpack-mock-validator")]
+#[command(name = "mock-rakurai")]
 struct Cli {
+    /// The relay's validator ingress.
     #[arg(long, default_value = "http://127.0.0.1:12350")]
     url: String,
+    /// Auth identity; derived from --seed when absent.
     #[arg(long)]
     keypair_path: Option<String>,
-    #[arg(long, default_value_t = 4)]
-    rate: u64,
-    #[arg(long, default_value_t = 8)]
-    batch_size: u64,
-    #[arg(long)]
-    repeat: bool,
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
+    #[command(flatten)]
+    feed: FeedArgs,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    postpack_mock_validator::init_tracing();
     let cli = Cli::parse();
 
-    let keypair = match &cli.keypair_path {
-        Some(path) => read_keypair_file(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?,
-        None => Keypair::new_from_array(tag(b"identity", cli.seed, 0)),
-    };
+    let keypair = postpack_mock_validator::identity(cli.keypair_path.as_deref(), cli.feed.seed)?;
     info!(identity = %keypair.pubkey(), url = %cli.url, "authenticating");
 
     let channel = Endpoint::from_str(&cli.url)?
@@ -117,33 +91,17 @@ async fn main() -> anyhow::Result<()> {
 
     info!("streaming to astralane and block_engine");
 
-    let payer = Keypair::new_from_array(tag(b"payer", cli.seed, 0));
-    let rate = cli.rate.max(1);
-    let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / rate));
-    let mut batch_index = 0u64;
+    let mut batches = Feed::spawn(&cli.feed).subscribe();
     loop {
-        ticker.tick().await;
-        // With --repeat every batch is sent twice.
-        let range = if cli.repeat {
-            batch_index / 2
-        } else {
-            batch_index
+        let batch = match batches.recv().await {
+            Ok(batch) => batch,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "relay is not keeping up, batches skipped");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => anyhow::bail!("feed stopped"),
         };
-        let base = range * cli.batch_size;
-        let packets: Vec<Packet> = (0..cli.batch_size)
-            .map(|i| packet(&payer, cli.seed, base + i))
-            .collect();
-
-        if send_batch(&astralane, &block_engine, &packets, batch_index)
-            .await
-            .is_err()
-        {
-            anyhow::bail!("relay stream closed");
-        }
-        batch_index += 1;
-        if batch_index % rate == 0 {
-            info!(batches = batch_index, "pushed");
-        }
+        send_batch(&astralane, &block_engine, &batch).await?;
     }
 }
 
@@ -178,56 +136,46 @@ async fn authenticate(channel: Channel, keypair: &Keypair) -> anyhow::Result<Str
 async fn send_batch(
     astralane: &mpsc::Sender<RelayUpdate>,
     block_engine: &mpsc::Sender<PacketBatchUpdate>,
-    packets: &[Packet],
-    index: u64,
+    batch: &Batch,
 ) -> anyhow::Result<()> {
+    let packets: Vec<Packet> = batch.transactions.iter().cloned().map(packet).collect();
+    let closed = || anyhow::anyhow!("relay stream closed");
     astralane
         .send(RelayUpdate {
-            msg: Some(Msg::Bundles(ExpiringBundleBatch {
+            msg: Some(relay_update::Msg::Bundles(ExpiringBundleBatch {
                 header: Some(header()),
                 bundles: vec![BundleUuid {
                     bundle: Some(Bundle {
                         header: Some(header()),
-                        packets: packets.to_vec(),
+                        packets: packets.clone(),
                     }),
-                    uuid: format!("mock-{index}"),
+                    uuid: format!("mock-{}", batch.index),
                 }],
                 expiry_ms: 0,
             })),
         })
-        .await?;
+        .await
+        .map_err(|_| closed())?;
     block_engine
         .send(PacketBatchUpdate {
             msg: Some(packet_batch_update::Msg::Batches(ExpiringPacketBatch {
                 header: Some(header()),
-                batch: Some(PacketBatch {
-                    packets: packets.to_vec(),
-                }),
+                batch: Some(PacketBatch { packets }),
                 expiry_ms: 0,
             })),
         })
-        .await?;
+        .await
+        .map_err(|_| closed())?;
     Ok(())
 }
 
 fn header() -> Header {
     Header {
-        ts: Some(Timestamp::from(SystemTime::now())),
+        ts: Some(postpack_mock_validator::now()),
     }
 }
 
-fn packet(payer: &Keypair, seed: u64, index: u64) -> Packet {
-    let recipient = solana_pubkey::Pubkey::new_from_array(tag(b"recipient", seed, index));
-    let blockhash = Hash::new_from_array(tag(b"blockhash", seed, index));
-    let instruction =
-        solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 1);
-    let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
-        Some(&payer.pubkey()),
-        &[payer],
-        blockhash,
-    );
-    let data = Bytes::from(bincode::serialize(&transaction).expect("serialize transaction"));
+fn packet(data: bytes::Bytes) -> Packet {
     Packet {
         meta: Some(Meta {
             size: data.len() as u64,
@@ -235,16 +183,6 @@ fn packet(payer: &Keypair, seed: u64, index: u64) -> Packet {
         }),
         data,
     }
-}
-
-fn tag(domain: &[u8], seed: u64, index: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    bytes[8..16].copy_from_slice(&index.to_le_bytes());
-    for (slot, byte) in bytes[16..].iter_mut().zip(domain.iter().cycle()) {
-        *slot = *byte;
-    }
-    bytes
 }
 
 fn watch_heartbeats(
