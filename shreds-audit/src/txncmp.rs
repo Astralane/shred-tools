@@ -9,7 +9,7 @@ use crossbeam_channel::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, GrpcMode, GrpcSourceCfg};
-use crate::deshred::{Deshredder, ShredInput};
+use crate::deshred::{DeshredMetrics, Deshredder, ShredInput};
 use crate::filters::{
     audit::{FilterAudit, WindowInfo},
     bundles::Bundle,
@@ -23,6 +23,7 @@ use crate::verification::onchain_signatures::{OnchainAudit, OnchainVerifier};
 pub struct TxnCompare {
     reg: Arc<Mutex<SigRegistry>>,
     feed: Option<Sender<ShredInput>>,
+    deshred_metrics: Arc<DeshredMetrics>,
     deshred_handle: Option<JoinHandle<()>>,
     async_handle: Option<JoinHandle<()>>,
     onchain: Option<OnchainVerifier>,
@@ -84,7 +85,8 @@ impl TxnCompare {
 
         // Bounded: a stalled deshredder drops feed instead of growing a backlog.
         let (feed, feed_rx) = crossbeam_channel::bounded::<ShredInput>(131_072);
-        let deshredder = Deshredder::new(reg.clone());
+        let deshred_metrics = Arc::new(DeshredMetrics::new(n_providers));
+        let deshredder = Deshredder::new(reg.clone(), deshred_metrics.clone());
         let deshred_handle = std::thread::Builder::new()
             .name("deshred".into())
             .spawn(move || deshredder.run(feed_rx))
@@ -142,6 +144,7 @@ impl TxnCompare {
         Ok(Some(Self {
             reg,
             feed: Some(feed),
+            deshred_metrics,
             deshred_handle,
             async_handle,
             onchain,
@@ -160,12 +163,12 @@ impl TxnCompare {
     }
 
     pub fn snapshot(&self) -> TxnCompareSummary {
-        build_snapshot(&self.reg, self.onchain_audit(), false)
+        build_snapshot(&self.reg, self.onchain_audit(), &self.deshred_metrics, false)
     }
 
     /// Finalizes every in-flight signature, including those still inside the eviction margin.
     pub fn final_snapshot(&self) -> TxnCompareSummary {
-        build_snapshot(&self.reg, self.onchain_audit(), true)
+        build_snapshot(&self.reg, self.onchain_audit(), &self.deshred_metrics, true)
     }
 
     fn onchain_audit(&self) -> Option<OnchainAudit> {
@@ -174,11 +177,14 @@ impl TxnCompare {
 
     pub fn feed(&self, rx_unix_ns: i64, provider: u16, data: &[u8]) {
         if let Some(feed) = &self.feed {
-            let _ = feed.try_send(ShredInput {
+            let input = ShredInput {
                 rx_unix_ns,
                 provider,
                 data: Bytes::copy_from_slice(data),
-            });
+            };
+            if feed.try_send(input).is_err() {
+                self.deshred_metrics.record_dropped(provider);
+            }
         }
     }
 
@@ -203,13 +209,14 @@ impl TxnCompare {
             v.finish();
             audit
         });
-        report(&self.reg, audit);
+        report(&self.reg, audit, &self.deshred_metrics);
     }
 }
 
 fn build_snapshot(
     reg: &Mutex<SigRegistry>,
     audit: Option<OnchainAudit>,
+    deshred: &DeshredMetrics,
     force: bool,
 ) -> TxnCompareSummary {
     let audit = audit.unwrap_or_default();
@@ -251,11 +258,12 @@ fn build_snapshot(
         onchain_slots_unavailable: audit.slots_unavailable,
         onchain_rpc_errors: audit.rpc_errors,
         onchain_last_error: audit.last_error,
+        deshred: deshred.snapshot(),
     }
 }
 
-fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>) {
-    let snap = build_snapshot(reg, audit, true);
+fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>, deshred: &DeshredMetrics) {
+    let snap = build_snapshot(reg, audit, deshred, true);
     eprintln!(
         "\ntxn-compare: {} distinct signatures, {} contested",
         snap.distinct_signatures, snap.contested
@@ -271,6 +279,20 @@ fn report(reg: &Mutex<SigRegistry>, audit: Option<OnchainAudit>) {
             s.behind_p90_us.unwrap_or(0.0),
             s.behind_p99_us.unwrap_or(0.0),
             s.seen,
+        );
+    }
+
+    eprintln!("\ndeshred (per shred provider):");
+    for (s, d) in snap.sources.iter().zip(&snap.deshred) {
+        eprintln!(
+            "  {:<20} fed {} dropped {} | data sets {} | errors: parse {} recovery {} decode {}",
+            s.name,
+            d.deshred_fed,
+            d.deshred_dropped,
+            d.deshred_data_sets,
+            d.deshred_parse_errors,
+            d.deshred_recovery_errors,
+            d.deshred_decode_errors,
         );
     }
 
@@ -416,11 +438,11 @@ mod tests {
         let kinds = vec![SourceKind::Shred, SourceKind::Grpc, SourceKind::GrpcDeshred];
         let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
 
-        let snap = build_snapshot(&reg, None, false);
+        let snap = build_snapshot(&reg, None, &DeshredMetrics::new(1), false);
         assert_eq!(snap.sources.len(), 3);
         assert_eq!(snap.sources[0].kind, SourceKind::Shred);
         assert_eq!(snap.sources[1].kind, SourceKind::Grpc);
-        assert_eq!(snap.sources[2].kind, SourceKind::GrpcDeshred);
+        assert_eq!(snap.sources[2].kind, SourceKind::GrpcDeshred);        assert_eq!(snap.deshred.len(), 1, "one deshred row per shred provider, none for gRPC");
     }
 
     #[test]
@@ -429,7 +451,7 @@ mod tests {
         let kinds = vec![SourceKind::Shred, SourceKind::Grpc, SourceKind::GrpcDeshred];
         let reg = Arc::new(Mutex::new(SigRegistry::new(names, kinds)));
 
-        let snap = build_snapshot(&reg, None, false);
+        let snap = build_snapshot(&reg, None, &DeshredMetrics::new(1), false);
         let json = serde_json::to_value(&snap).unwrap();
         let kinds: Vec<&str> = json["sources"]
             .as_array()

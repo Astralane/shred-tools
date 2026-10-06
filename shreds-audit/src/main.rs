@@ -286,7 +286,7 @@ fn main() -> Result<()> {
             }
         } else if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();
-            report(&rx_stats, &vstats, &aggregator, &stats, registry.names());
+            report(&rx_stats, &vstats, &aggregator, &stats, registry.names(), txn_snap.as_ref());
         }
         if last_sender_check.elapsed() >= Duration::from_secs(10) {
             last_sender_check = Instant::now();
@@ -393,7 +393,7 @@ fn main() -> Result<()> {
         archives.push(path);
     }
 
-    report(&rx_stats, &vstats, &aggregator, &stats, registry.names());
+    report(&rx_stats, &vstats, &aggregator, &stats, registry.names(), txn_snap.as_ref());
 
     if let Some(tc) = txn_compare {
         tc.finish();
@@ -454,6 +454,7 @@ fn report(
     agg: &Aggregator,
     stats: &WindowStats,
     providers: &[String],
+    txn: Option<&TxnCompareSummary>,
 ) {
     eprintln!(
         "rx {} (unmatched {}, no_ts {}, dropped {}, kernel_drop {}, trunc {}) | parsed {} bad_sig {} (data {}) proof_stripped {} no_leader {} malformed {} ping {} unsupported {} | ed25519 {} (batch_fallback {}) | after_window {} | pending sets {}",
@@ -493,5 +494,16 @@ fn report(
             invalid.invalid_data,
             invalid.invalid_unknown,
         );
+        if let Some(d) = txn.and_then(|t| t.deshred.get(id)) {
+            eprintln!(
+                "  {name}: deshred fed {} dropped {} data_sets {} | errors parse {} recovery {} decode {}",
+                d.deshred_fed,
+                d.deshred_dropped,
+                d.deshred_data_sets,
+                d.deshred_parse_errors,
+                d.deshred_recovery_errors,
+                d.deshred_decode_errors,
+            );
+        }
     }
 }

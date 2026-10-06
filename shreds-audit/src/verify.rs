@@ -55,8 +55,10 @@ pub struct VerifiedShred {
 }
 
 impl VerifiedShred {
+    /// Proven leader-signed. An unknown leader (`sig_ok == None`) is unverifiable, not
+    /// authentic: it is neither reconstructed nor timed, matching the aggregator.
     pub fn is_authentic(&self) -> bool {
-        self.merkle_ok && self.sig_ok != Some(false)
+        self.merkle_ok && self.sig_ok == Some(true)
     }
 }
 

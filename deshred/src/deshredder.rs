@@ -34,6 +34,9 @@ pub struct DeshredStats {
     pub recoveries: u64,
     pub recovered_shreds: u64,
     pub recovery_time: Duration,
+    /// Reed-Solomon attempts that failed outright or rebuilt a shred that would not parse.
+    pub recovery_errors: u64,
+    /// Complete data sets whose payload would not deshred or deserialize into entries.
     pub decode_errors: u64,
 }
 
@@ -82,6 +85,9 @@ impl Deshredder {
             self.stats.recoveries += 1;
             self.stats.recovered_shreds += recovery.recovered_shreds as u64;
             self.stats.recovery_time += recovery.elapsed;
+            if recovery.failed {
+                self.stats.recovery_errors += 1;
+            }
             if recovery.recovered_shreds > 0 {
                 inserted_data_range = Some(recovery.fec_set_data_range);
             }
@@ -132,6 +138,7 @@ struct RecoveryStats {
     fec_set_data_range: RangeInclusive<u32>,
     elapsed: Duration,
     recovered_shreds: usize,
+    failed: bool,
 }
 
 enum DataShred {
@@ -254,11 +261,23 @@ impl SlotState {
             .chain(coding_set.coding_shreds.iter().cloned())
             .collect();
         self.coding_sets[position].recovery_attempts += 1;
-        let recovered_shreds = recover(recovery_input, cache)
-            .ok()?
-            .flatten()
-            .filter(|shred| shred.is_data() && self.insert_data_shred(shred.clone()))
-            .count();
+        let mut failed = false;
+        let mut recovered_shreds = 0;
+        match recover(recovery_input, cache) {
+            Ok(shreds) => {
+                for shred in shreds {
+                    match shred {
+                        Ok(shred) => {
+                            if shred.is_data() && self.insert_data_shred(shred) {
+                                recovered_shreds += 1;
+                            }
+                        }
+                        Err(_) => failed = true,
+                    }
+                }
+            }
+            Err(_) => failed = true,
+        }
         if missing_data_shreds(&self.data_shreds, data_range.clone()) == 0 {
             self.coding_sets.swap_remove(position);
         }
@@ -266,6 +285,7 @@ impl SlotState {
             fec_set_data_range: data_range,
             elapsed: started.elapsed(),
             recovered_shreds,
+            failed,
         })
     }
 
@@ -499,6 +519,29 @@ mod tests {
         );
         let stats = deshredder.stats();
         assert_eq!((stats.recoveries, stats.recovered_shreds), (1, 1));
+        assert_eq!(stats.recovery_errors, 0);
+    }
+
+    #[test]
+    fn counts_a_failed_recovery() {
+        let (data, _) = shred(&entries(1_000), 0, false);
+        let other: Vec<Entry> = (0..1_000)
+            .map(|_| Entry::new(&Hash::new_unique(), 1, Vec::new()))
+            .collect();
+        let (_, foreign_coding) = shred(&other, 0, false);
+        let fec = data[0].fec_set_index();
+        let mut deshredder = Deshredder::default();
+        insert_all(&mut deshredder, data.into_iter().skip(1));
+
+        // Coding shreds from another block at the same index: a different merkle root.
+        let completed = insert_all(
+            &mut deshredder,
+            foreign_coding.into_iter().filter(|s| s.fec_set_index() == fec),
+        );
+        assert!(completed.is_empty());
+        let stats = deshredder.stats();
+        assert!(stats.recovery_errors > 0);
+        assert_eq!(stats.recovered_shreds, 0);
     }
 
     #[test]

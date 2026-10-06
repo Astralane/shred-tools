@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::{
     config::Config,
+    deshred::ProviderDeshredStats,
     leader::LeaderSchedule,
     pinger::NetMon,
     registry::Registry,
@@ -57,6 +58,9 @@ pub struct TxnCompareSummary {
     pub onchain_rpc_errors: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onchain_last_error: Option<String>,
+    /// Indexed by provider id; reported under `provider_shreds` and `counters`.
+    #[serde(skip)]
+    pub deshred: Vec<ProviderDeshredStats>,
 }
 
 #[derive(Serialize, Clone)]
@@ -89,6 +93,9 @@ pub struct ProviderShreds {
     pub invalid_sig: u64,
     pub invalid_data: u64,
     pub invalid_unknown: u64,
+    /// Absent when no reconstruction ran (no `grpc_sources`).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub deshred: Option<ProviderDeshredStats>,
 }
 
 #[derive(Serialize, Clone)]
@@ -128,6 +135,12 @@ pub struct Counters {
     pub txs_legacy: u64,
     pub txs_v0: u64,
     pub txs_v1: u64,
+    pub deshred_fed: u64,
+    pub deshred_dropped: u64,
+    pub deshred_parse_errors: u64,
+    pub deshred_recovery_errors: u64,
+    pub deshred_decode_errors: u64,
+    pub deshred_data_sets: u64,
 }
 
 impl Counters {
@@ -139,6 +152,7 @@ impl Counters {
         txn: Option<&TxnCompareSummary>,
     ) -> Self {
         let versions = txn.map(|t| t.tx_versions).unwrap_or_default();
+        let deshred = deshred_total(txn);
         Self {
             udp_received: rx.received.load(Ordering::Relaxed),
             udp_unmatched: rx.unmatched.load(Ordering::Relaxed),
@@ -165,8 +179,27 @@ impl Counters {
             txs_legacy: versions.legacy,
             txs_v0: versions.v0,
             txs_v1: versions.v1,
+            deshred_fed: deshred.deshred_fed,
+            deshred_dropped: deshred.deshred_dropped,
+            deshred_parse_errors: deshred.deshred_parse_errors,
+            deshred_recovery_errors: deshred.deshred_recovery_errors,
+            deshred_decode_errors: deshred.deshred_decode_errors,
+            deshred_data_sets: deshred.deshred_data_sets,
         }
     }
+}
+
+fn deshred_total(txn: Option<&TxnCompareSummary>) -> ProviderDeshredStats {
+    let mut total = ProviderDeshredStats::default();
+    for d in txn.map(|t| t.deshred.as_slice()).unwrap_or_default() {
+        total.deshred_fed += d.deshred_fed;
+        total.deshred_dropped += d.deshred_dropped;
+        total.deshred_parse_errors += d.deshred_parse_errors;
+        total.deshred_recovery_errors += d.deshred_recovery_errors;
+        total.deshred_decode_errors += d.deshred_decode_errors;
+        total.deshred_data_sets += d.deshred_data_sets;
+    }
+    total
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,6 +307,7 @@ pub fn build_manifest(
         ));
     }
     if let Some(t) = txn {
+        notes.extend(deshred_notes(registry, t));
         notes.extend(onchain_notes(cfg, t));
     }
     if stats.rows_txns > 0 {
@@ -307,7 +341,7 @@ pub fn build_manifest(
         rows_fec_sets: stats.rows_sets,
         rows_shreds: stats.rows_shreds,
         rows_txns: stats.rows_txns,
-        provider_shreds: provider_shreds(registry, vstats, stats),
+        provider_shreds: provider_shreds(registry, vstats, stats, txn),
         provider_pings: netmon.provider_pings(cfg, registry),
         leader_names: schedule.leader_names(),
         txn_compare: txn.cloned(),
@@ -320,6 +354,7 @@ fn provider_shreds(
     registry: &Registry,
     vstats: &VerifyStats,
     stats: &WindowStats,
+    txn: Option<&TxnCompareSummary>,
 ) -> Vec<ProviderShreds> {
     registry
         .names()
@@ -333,9 +368,44 @@ fn provider_shreds(
                 invalid_sig: invalid.invalid_sig,
                 invalid_data: invalid.invalid_data,
                 invalid_unknown: invalid.invalid_unknown,
+                deshred: txn.map(|t| t.deshred.get(id).copied().unwrap_or_default()),
             }
         })
         .collect()
+}
+
+fn deshred_notes(registry: &Registry, txn: &TxnCompareSummary) -> Vec<String> {
+    let mut notes = Vec::new();
+    let dropped: u64 = txn.deshred.iter().map(|d| d.deshred_dropped).sum();
+    if dropped > 0 {
+        notes.push(format!(
+            "{dropped} authenticated shreds were dropped before reconstruction because the deshred \
+             queue was full (`deshred_dropped`). This is OUR loss, not a provider's: the \
+             transactions in them are missing from the shred sources' `seen`, winrate and onchain \
+             `onchain_missed`. This host could not keep up with reconstruction"
+        ));
+    }
+    for (name, d) in registry.names().iter().zip(&txn.deshred) {
+        if d.errors() == 0 {
+            continue;
+        }
+        notes.push(format!(
+            "provider `{name}`: {} shreds that passed signature verification failed real \
+             reconstruction — {} would not parse, {} Reed-Solomon recoveries failed, {} complete \
+             data sets would not decode into entries (out of {} fed, {} data sets decoded). Every one \
+             carried a valid leader signature, so this is not tampering in transit: the usual \
+             cause is a leader that signed two versions of a slot (a duplicate block) and the \
+             provider relaying shreds from both, then a malformed block, then this build's agave \
+             version lagging the cluster",
+            d.errors(),
+            d.deshred_parse_errors,
+            d.deshred_recovery_errors,
+            d.deshred_decode_errors,
+            d.deshred_fed,
+            d.deshred_data_sets,
+        ));
+    }
+    notes
 }
 
 fn onchain_notes(cfg: &Config, txn: &TxnCompareSummary) -> Vec<String> {

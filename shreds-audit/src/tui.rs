@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use crate::{
+    deshred::ProviderDeshredStats,
     live::LiveStats,
     out::{TxnCompareSummary, TxnSource},
     registry::Registry,
@@ -104,8 +105,16 @@ fn render(
     txn: Option<&TxnCompareSummary>,
     footer: &str,
 ) {
-    let mut txn_srcs: Vec<&TxnSource> = txn
-        .map(|t| t.sources.iter().filter(|s| s.seen > 0).collect())
+    // Shred providers come first in source order, so a source's index is its provider id.
+    let mut txn_srcs: Vec<(&TxnSource, Option<&ProviderDeshredStats>)> = txn
+        .map(|t| {
+            t.sources
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.seen > 0)
+                .map(|(sid, s)| (s, t.deshred.get(sid)))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
@@ -167,8 +176,10 @@ fn render(
     f.render_widget(table, areas[1]);
 
     if let Some(t) = txn.filter(|_| !txn_srcs.is_empty()) {
-        txn_srcs.sort_by(|a, b| b.winrate.unwrap_or(-1.0).total_cmp(&a.winrate.unwrap_or(-1.0)));
-        let rows = txn_srcs.into_iter().map(|s| {
+        txn_srcs.sort_by(|(a, _), (b, _)| {
+            b.winrate.unwrap_or(-1.0).total_cmp(&a.winrate.unwrap_or(-1.0))
+        });
+        let rows = txn_srcs.into_iter().map(|(s, deshred)| {
             Row::new([
                 s.name.clone(),
                 s.kind.label().to_string(),
@@ -177,6 +188,7 @@ fn render(
                 us(s.behind_p90_us),
                 fmt_int(s.seen),
                 fmt_bad_sigs(s),
+                fmt_deshred(deshred),
             ])
         });
         let audited = if t.onchain_slots_checked > 0 {
@@ -194,11 +206,21 @@ fn render(
                 Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(17),
+                Constraint::Length(19),
             ],
         )
         .header(
-            Row::new(["source", "kind", "winrate", "µs behind", "µs p90", "seen", "bad sigs"])
-                .style(bold()),
+            Row::new([
+                "source",
+                "kind",
+                "winrate",
+                "µs behind",
+                "µs p90",
+                "seen",
+                "bad sigs",
+                "decode err / drop",
+            ])
+            .style(bold()),
         )
         .block(Block::default().borders(Borders::ALL).title(format!(
             " transaction race — shreds vs gRPC · {} contested txns{audited} ",
@@ -234,6 +256,14 @@ fn fmt_bad_sigs(s: &TxnSource) -> String {
         format!("{pct:.2}%")
     };
     format!("{pct} ({})", fmt_int(s.onchain_bad))
+}
+
+/// Reconstruction errors and queue drops; `—` for sources this tool doesn't deshred.
+fn fmt_deshred(d: Option<&ProviderDeshredStats>) -> String {
+    match d {
+        Some(d) => format!("{} / {}", fmt_int(d.errors()), fmt_int(d.deshred_dropped)),
+        None => "—".into(),
+    }
 }
 
 /// Thousands separators.

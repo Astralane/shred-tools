@@ -14,6 +14,7 @@ use postgres::{Client, NoTls};
 use crate::{
     agg::SetRow,
     config::{Config, PostgresCfg},
+    deshred::ProviderDeshredStats,
     live::LiveStats,
     registry::{ProviderId, Registry},
 };
@@ -29,6 +30,7 @@ pub struct PgSink {
     names: Vec<String>,
     fold: IntervalFold,
     prev: Counters,
+    prev_deshred: Vec<ProviderDeshredStats>,
     since: Instant,
     flush_every: Duration,
     tx: Sender<Batch>,
@@ -78,6 +80,7 @@ impl PgSink {
             fold: IntervalFold::new(names.len()),
             names,
             prev: Counters::default(),
+            prev_deshred: Vec::new(),
             since: Instant::now(),
             flush_every: Duration::from_secs(pg.flush_secs),
             tx,
@@ -96,10 +99,21 @@ impl PgSink {
     }
 
     pub fn flush(&mut self, m: &Manifest) {
+        let deshred: Vec<ProviderDeshredStats> = m
+            .provider_shreds
+            .iter()
+            .map(|p| p.deshred.unwrap_or_default())
+            .collect();
+        let mut providers = self.fold.rows(&self.names);
+        for (id, row) in providers.iter_mut().enumerate() {
+            let now = deshred.get(id).copied().unwrap_or_default();
+            let prev = self.prev_deshred.get(id).copied().unwrap_or_default();
+            row.deshred = now.since(&prev);
+        }
         let batch = Batch {
             at: SystemTime::now(),
             window_secs: self.since.elapsed().as_secs_f64(),
-            providers: self.fold.rows(&self.names),
+            providers,
             sources: m
                 .txn_compare
                 .as_ref()
@@ -110,6 +124,7 @@ impl PgSink {
         };
 
         self.prev = m.counters.clone();
+        self.prev_deshred = deshred;
         self.since = Instant::now();
         self.fold.reset();
 
@@ -238,6 +253,7 @@ impl IntervalFold {
                     fill_sum_us: s.fill_sum_us,
                     fill_n: s.fill_n,
                     fill_max_us: s.fill_max_us,
+                    deshred: ProviderDeshredStats::default(),
                 }
             })
             .collect()
@@ -298,6 +314,8 @@ struct ProviderRow {
     fill_sum_us: f64,
     fill_n: u64,
     fill_max_us: f64,
+    /// Interval delta, filled in by `PgSink::flush`.
+    deshred: ProviderDeshredStats,
 }
 
 fn writer_loop(
@@ -366,8 +384,11 @@ INSERT INTO provider_stats (
     missed, invalid, invalid_sig, invalid_data, invalid_unknown,
     duplicated, sig_unverifiable,
     shreds_data, shreds_code,
-    fill_sum_us, fill_n, fill_max_us
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+    fill_sum_us, fill_n, fill_max_us,
+    deshred_fed, deshred_dropped, deshred_parse_errors,
+    deshred_recovery_errors, deshred_decode_errors, deshred_data_sets
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+          $25,$26,$27,$28,$29,$30)
 ON CONFLICT DO NOTHING";
 
 const SOURCE_SQL: &str = "\
@@ -443,6 +464,12 @@ fn write_batch(client: &mut Client, host: &str, b: &Batch) -> Result<()> {
                 &p.fill_sum_us,
                 &(p.fill_n as i64),
                 &p.fill_max_us,
+                &(p.deshred.deshred_fed as i64),
+                &(p.deshred.deshred_dropped as i64),
+                &(p.deshred.deshred_parse_errors as i64),
+                &(p.deshred.deshred_recovery_errors as i64),
+                &(p.deshred.deshred_decode_errors as i64),
+                &(p.deshred.deshred_data_sets as i64),
             ],
         )?;
     }
@@ -605,7 +632,7 @@ mod tests {
         assert_eq!(deltas["shreds_parsed"], 40);
         assert_eq!(
             deltas.len(),
-            25,
+            31,
             "every field of Counters must reach the database; add one and this moves"
         );
     }
@@ -765,6 +792,14 @@ mod tests {
                 fill_sum_us: 18.5,
                 fill_n: 19,
                 fill_max_us: 20.5,
+                deshred: ProviderDeshredStats {
+                    deshred_fed: 42,
+                    deshred_dropped: 43,
+                    deshred_parse_errors: 44,
+                    deshred_recovery_errors: 45,
+                    deshred_decode_errors: 46,
+                    deshred_data_sets: 47,
+                },
             }],
             sources: vec![TxnSource {
                 name: "grpc-a".into(),
@@ -817,6 +852,12 @@ mod tests {
         assert_eq!(p.get::<_, f64>("fill_sum_us"), 18.5);
         assert_eq!(p.get::<_, i64>("fill_n"), 19);
         assert_eq!(p.get::<_, f64>("fill_max_us"), 20.5);
+        assert_eq!(p.get::<_, i64>("deshred_fed"), 42);
+        assert_eq!(p.get::<_, i64>("deshred_dropped"), 43);
+        assert_eq!(p.get::<_, i64>("deshred_parse_errors"), 44);
+        assert_eq!(p.get::<_, i64>("deshred_recovery_errors"), 45);
+        assert_eq!(p.get::<_, i64>("deshred_decode_errors"), 46);
+        assert_eq!(p.get::<_, i64>("deshred_data_sets"), 47);
 
         let s = client
             .query_one("SELECT * FROM txn_source_stats WHERE host = $1", &[&host])

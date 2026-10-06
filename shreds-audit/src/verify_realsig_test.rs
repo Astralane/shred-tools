@@ -293,6 +293,10 @@ fn unknown_leader_is_unverifiable_not_bad() {
     let out = verify_chunk(&packets(&shreds), &sched, Some(42), &mut stats);
 
     assert!(out.iter().all(|s| s.sig_ok.is_none()), "no leader -> no verdict");
+    assert!(
+        out.iter().all(|s| !s.is_authentic()),
+        "unverifiable shreds must never reach reconstruction"
+    );
     assert_eq!(stats.sig_bad, 0, "unknown leader must never be counted as a bad signature");
     assert!(stats.no_leader >= 1);
 }

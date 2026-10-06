@@ -42,8 +42,24 @@ CREATE TABLE IF NOT EXISTS provider_stats (
     fill_n           bigint           NOT NULL,
     fill_max_us      double precision NOT NULL,
 
+    deshred_fed             bigint NOT NULL DEFAULT 0,
+    deshred_dropped         bigint NOT NULL DEFAULT 0,
+    deshred_parse_errors    bigint NOT NULL DEFAULT 0,
+    deshred_recovery_errors bigint NOT NULL DEFAULT 0,
+    deshred_decode_errors   bigint NOT NULL DEFAULT 0,
+    deshred_data_sets       bigint NOT NULL DEFAULT 0,
+
     PRIMARY KEY (ts, host, provider)
 );
+
+-- Tables created before the deshred columns existed.
+ALTER TABLE provider_stats
+    ADD COLUMN IF NOT EXISTS deshred_fed             bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deshred_dropped         bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deshred_parse_errors    bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deshred_recovery_errors bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deshred_decode_errors   bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS deshred_data_sets       bigint NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS txn_source_stats (
     ts                    timestamptz      NOT NULL,

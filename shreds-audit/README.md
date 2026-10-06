@@ -234,9 +234,24 @@ grpc_sources:
 execution, so it has no commitment or transaction-status metadata. Do not set
 `commitment` on a `deshred` source. Both modes are matched to locally
 reconstructed transactions by `transaction.signatures[0]`. The local
-reconstruction only uses shreds that pass verification (a valid merkle proof and
-a signature that is not bad), so invalid shreds a provider sends never reach its
-transactions; they are counted in the raw-shred stats instead.
+reconstruction only uses shreds proven leader-signed (a valid merkle proof and a
+signature that verifies against a known leader), so invalid shreds a provider
+sends never reach its transactions; they are counted in the raw-shred stats
+instead. Shreds whose slot leader is unknown are unverifiable and are left out
+too.
+
+The reconstruction is real — Reed-Solomon recovery, deshredding and entry
+deserialization per provider — and every failure is counted per provider in
+`provider_shreds` (and summed in `counters`):
+
+| field | meaning |
+|---|---|
+| `deshred_fed` | authenticated shreds handed to the provider's reconstruction |
+| `deshred_dropped` | authenticated shreds dropped because the deshred queue was full — **our** loss, not the provider's |
+| `deshred_parse_errors` | verified shreds agave would not parse |
+| `deshred_recovery_errors` | failed Reed-Solomon recovery attempts |
+| `deshred_decode_errors` | complete data sets that would not deshred into entries |
+| `deshred_data_sets` | data sets decoded successfully |
 
 The two modes stay distinguishable everywhere they are reported. In the manifest
 and the dashboard each source carries a `kind` — `shreds` for the local shred
@@ -387,8 +402,9 @@ Each run writes `shred-audit-<timestamp>-<hostname>.zip` containing:
   capture was incomplete before you draw conclusions from it. Its
   **`provider_shreds`** section breaks the raw shreds down per provider: parsed,
   malformed, wrong version, unsupported variant, no merkle root, no leader, bad
-  signature, stripped proof, and the `invalid_sig` / `invalid_data` /
-  `invalid_unknown` split.
+  signature, stripped proof, the `invalid_sig` / `invalid_data` /
+  `invalid_unknown` split, and — with `grpc_sources` configured — the
+  `deshred_*` reconstruction counters.
 - **`fec_sets.parquet`** — one row per (provider, slot, FEC set) with timing,
   delivery counts, and validity. This is the table you compare providers on.
 - **`shreds.parquet`** — one row per shred, only present if you passed
