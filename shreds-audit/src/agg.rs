@@ -86,6 +86,8 @@ pub struct Aggregator {
     /// index spaces overlap, and mixing them misreports broken proofs as altered data.
     truth: AHashMap<(u64, u32, bool, u32), [u8; 32]>,
     max_slot: u64,
+    /// Highest slot per provider among leader-signed shreds, so forged slots can't inflate it.
+    latest_slot: AHashMap<ProviderId, u64>,
     max_wait_slots: u64,
     /// Highest harvested cutoff; sets at or below it are already emitted.
     evicted_upto: u64,
@@ -98,6 +100,7 @@ impl Aggregator {
             sets: AHashMap::new(),
             truth: AHashMap::new(),
             max_slot: 0,
+            latest_slot: AHashMap::new(),
             max_wait_slots,
             evicted_upto: 0,
             shreds_after_window: 0,
@@ -112,12 +115,20 @@ impl Aggregator {
         self.max_slot
     }
 
+    pub fn latest_slot(&self, provider: ProviderId) -> Option<u64> {
+        self.latest_slot.get(&provider).copied()
+    }
+
     pub fn shreds_after_window(&self) -> u64 {
         self.shreds_after_window
     }
 
     pub fn ingest(&mut self, s: &VerifiedShred) {
         self.max_slot = self.max_slot.max(s.slot);
+        if s.is_authentic() {
+            let latest = self.latest_slot.entry(s.provider).or_default();
+            *latest = (*latest).max(s.slot);
+        }
         // Re-creating an emitted set would produce a second row that overwrites the
         // real one (viewer is last-wins). Sets drained early by rotation can still be
         // re-created — a known limitation.

@@ -11,14 +11,14 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request};
 
-use postpack_mock_validator::proto::gravity::auth::auth_service_client::AuthServiceClient;
-use postpack_mock_validator::proto::gravity::auth::{
+use postpack_tools::proto::gravity::auth::auth_service_client::AuthServiceClient;
+use postpack_tools::proto::gravity::auth::{
     GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role,
 };
-use postpack_mock_validator::proto::gravity::searcher::searcher_service_client::SearcherServiceClient;
-use postpack_mock_validator::proto::gravity::searcher::{BundleSubscription, MempoolSubscription};
-use postpack_mock_validator::proto::jito::bam_preconf::PreconfSubscribeRequest;
-use postpack_mock_validator::proto::jito::bam_preconf::preconf_stream_client::PreconfStreamClient;
+use postpack_tools::proto::gravity::searcher::searcher_service_client::SearcherServiceClient;
+use postpack_tools::proto::gravity::searcher::{BundleSubscription, MempoolSubscription};
+use postpack_tools::proto::jito::bam_preconf::PreconfSubscribeRequest;
+use postpack_tools::proto::jito::bam_preconf::preconf_stream_client::PreconfStreamClient;
 
 struct Mock(Child);
 
@@ -159,7 +159,11 @@ async fn gravity_authenticates_a_searcher_and_streams_both_feeds() {
     };
     assert_eq!(notification.identity_address.as_ref(), identity.as_ref());
     assert_eq!(notification.transactions.len(), 3);
-    assert!(notification.transactions[0].data[1..65].iter().any(|b| *b != 0));
+    assert!(
+        notification.transactions[0].data[1..65]
+            .iter()
+            .any(|b| *b != 0)
+    );
 
     let mut bundles = searcher
         .subscribe_bundles(authed(BundleSubscription {}, &token))

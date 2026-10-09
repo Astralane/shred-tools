@@ -18,11 +18,11 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use postpack_mock_validator::proto::jito::bam_preconf::preconf_stream_server::{
+use postpack_tools::proto::jito::bam_preconf::preconf_stream_server::{
     PreconfStream, PreconfStreamServer,
 };
-use postpack_mock_validator::proto::jito::bam_preconf::{PreconfSubscribeRequest, PreconfUpdate};
-use postpack_mock_validator::{Feed, FeedArgs};
+use postpack_tools::proto::jito::bam_preconf::{PreconfSubscribeRequest, PreconfUpdate};
+use postpack_tools::{Feed, FeedArgs};
 
 #[derive(Parser)]
 #[command(name = "mock-bam")]
@@ -58,7 +58,9 @@ impl Bam {
         let signature = Signature::try_from(message.signature.as_ref())
             .map_err(|_| Status::unauthenticated("malformed signature"))?;
         if !signature.verify(pubkey.as_ref(), &message.signed_slot.to_le_bytes()) {
-            return Err(Status::unauthenticated("signature does not match x-bam-pubkey"));
+            return Err(Status::unauthenticated(
+                "signature does not match x-bam-pubkey",
+            ));
         }
         if !self.allowed.is_empty() && !self.allowed.contains(&pubkey) {
             return Err(Status::permission_denied("pubkey is not allowed"));
@@ -117,7 +119,7 @@ impl PreconfStream for Bam {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    postpack_mock_validator::init_tracing();
+    postpack_tools::init_tracing();
     let cli = Cli::parse();
 
     let bam = Bam {

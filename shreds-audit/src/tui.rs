@@ -68,10 +68,11 @@ impl Tui {
         &mut self,
         stats: &LiveStats,
         reg: &Registry,
+        slots: &[Option<u64>],
         txn: Option<&TxnCompareSummary>,
         footer: &str,
     ) -> Result<()> {
-        self.terminal.draw(|f| render(f, stats, reg, txn, footer))?;
+        self.terminal.draw(|f| render(f, stats, reg, slots, txn, footer))?;
         Ok(())
     }
 }
@@ -102,6 +103,7 @@ fn render(
     f: &mut Frame,
     stats: &LiveStats,
     reg: &Registry,
+    slots: &[Option<u64>],
     txn: Option<&TxnCompareSummary>,
     footer: &str,
 ) {
@@ -124,13 +126,18 @@ fn render(
     constraints.push(Constraint::Length(1));
     let areas = Layout::vertical(constraints).split(f.area());
 
+    // Every source's latest slot is shown relative to the highest any source has reached.
+    let txn_slots = txn.into_iter().flat_map(|t| t.sources.iter().filter_map(|s| s.latest_slot));
+    let tip = slots.iter().flatten().copied().chain(txn_slots).max();
+
     let total = stats.total_sets();
     let title = Line::from(vec![
         Span::styled("shred-audit", bold()),
         Span::raw(format!(
-            "   {} sets · {} contested",
+            "   {} sets · {} contested · tip slot {}",
             fmt_int(total),
-            fmt_int(stats.contested_sets())
+            fmt_int(stats.contested_sets()),
+            tip.map_or_else(|| "—".into(), |t| t.to_string()),
         )),
     ]);
     f.render_widget(Paragraph::new(title), areas[0]);
@@ -149,6 +156,7 @@ fn render(
         let p = stats.provider(id);
         Row::new([
             reg.name(id).to_string(),
+            fmt_slot(slots.get(id as usize).copied().flatten(), tip),
             pct(p.winrate()),
             us(p.mean_behind_us()),
             pct(p.coverage(total)),
@@ -159,6 +167,7 @@ fn render(
         rows,
         [
             Constraint::Min(12),
+            Constraint::Length(17),
             Constraint::Length(9),
             Constraint::Length(11),
             Constraint::Length(9),
@@ -166,7 +175,7 @@ fn render(
         ],
     )
     .header(
-        Row::new(["provider", "winrate", "µs behind", "coverage", "valid/seen"]).style(bold()),
+        Row::new(["provider", "latest slot", "winrate", "µs behind", "coverage", "valid/seen"]).style(bold()),
     )
     .block(
         Block::default()
@@ -183,6 +192,7 @@ fn render(
             Row::new([
                 s.name.clone(),
                 s.kind.label().to_string(),
+                fmt_slot(s.latest_slot, tip),
                 pct(s.winrate),
                 us(s.behind_p50_us),
                 us(s.behind_p90_us),
@@ -201,6 +211,7 @@ fn render(
             [
                 Constraint::Min(14),
                 Constraint::Length(13),
+                Constraint::Length(17),
                 Constraint::Length(9),
                 Constraint::Length(11),
                 Constraint::Length(9),
@@ -213,6 +224,7 @@ fn render(
             Row::new([
                 "source",
                 "kind",
+                "latest slot",
                 "winrate",
                 "µs behind",
                 "µs p90",
@@ -263,6 +275,15 @@ fn fmt_deshred(d: Option<&ProviderDeshredStats>) -> String {
     match d {
         Some(d) => format!("{} / {}", fmt_int(d.errors()), fmt_int(d.deshred_dropped)),
         None => "—".into(),
+    }
+}
+
+/// Slot plus how many slots it trails the tip; no separators, so it matches explorers.
+fn fmt_slot(slot: Option<u64>, tip: Option<u64>) -> String {
+    match (slot, tip) {
+        (Some(s), Some(t)) if t > s => format!("{s} (-{})", t - s),
+        (Some(s), _) => s.to_string(),
+        (None, _) => "—".into(),
     }
 }
 

@@ -68,6 +68,9 @@ pub struct TxnSource {
     pub name: String,
     pub kind: SourceKind,
     pub seen: u64,
+    /// Live-only: a point-in-time value, not a property of the capture.
+    #[serde(skip)]
+    pub latest_slot: Option<u64>,
     pub contested: u64,
     pub winrate: Option<f64>,
     pub behind_mean_us: Option<f64>,

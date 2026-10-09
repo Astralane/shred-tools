@@ -805,6 +805,7 @@ mod tests {
                 name: "grpc-a".into(),
                 kind: SourceKind::Grpc,
                 seen: 21,
+                latest_slot: None,
                 contested: 22,
                 winrate: Some(0.23),
                 behind_mean_us: Some(24.0),

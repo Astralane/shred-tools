@@ -22,24 +22,22 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use postpack_mock_validator::proto::gravity::auth::auth_service_server::{
-    AuthService, AuthServiceServer,
-};
-use postpack_mock_validator::proto::gravity::auth::{
+use postpack_tools::proto::gravity::auth::auth_service_server::{AuthService, AuthServiceServer};
+use postpack_tools::proto::gravity::auth::{
     GenerateAuthChallengeRequest, GenerateAuthChallengeResponse, GenerateAuthTokensRequest,
     GenerateAuthTokensResponse, Token,
 };
-use postpack_mock_validator::proto::gravity::bundle::JitoBundle;
-use postpack_mock_validator::proto::gravity::packet::{Meta, Packet};
-use postpack_mock_validator::proto::gravity::searcher::searcher_service_server::{
+use postpack_tools::proto::gravity::bundle::JitoBundle;
+use postpack_tools::proto::gravity::packet::{Meta, Packet};
+use postpack_tools::proto::gravity::searcher::searcher_service_server::{
     SearcherService, SearcherServiceServer,
 };
-use postpack_mock_validator::proto::gravity::searcher::{
+use postpack_tools::proto::gravity::searcher::{
     BundleSubscription, MempoolSubscription, PendingTxNotification, SendBackrunBundleRequest,
     SendBackrunBundleResponse, SendBundleRequest, SendBundleResponse,
 };
-use postpack_mock_validator::proto::gravity::shared::Header;
-use postpack_mock_validator::{Batch, Feed, FeedArgs};
+use postpack_tools::proto::gravity::shared::Header;
+use postpack_tools::{Batch, Feed, FeedArgs};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
@@ -202,13 +200,15 @@ impl SearcherService for Searcher {
         info!(peer = ?request.remote_addr(), "bundles subscribed");
         let identity = self.identity.clone();
         let seed = self.seed;
-        Ok(Response::new(subscribe(&self.feed, "bundles", move |batch| {
-            JitoBundle {
+        Ok(Response::new(subscribe(
+            &self.feed,
+            "bundles",
+            move |batch| JitoBundle {
                 header: Some(Header {
-                    ts: Some(postpack_mock_validator::now()),
+                    ts: Some(postpack_tools::now()),
                 }),
                 identity_address: identity.clone(),
-                bundle_id: Bytes::copy_from_slice(&postpack_mock_validator::tag(
+                bundle_id: Bytes::copy_from_slice(&postpack_tools::tag(
                     b"bundle",
                     seed,
                     batch.index,
@@ -216,10 +216,10 @@ impl SearcherService for Searcher {
                 packets: batch
                     .transactions
                     .iter()
-                    .map(|transaction| packet(postpack_mock_validator::redact_signatures(transaction)))
+                    .map(|transaction| packet(postpack_tools::redact_signatures(transaction)))
                     .collect(),
-            }
-        })))
+            },
+        )))
     }
 }
 
@@ -270,12 +270,12 @@ fn packet(data: Bytes) -> Packet {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    postpack_mock_validator::init_tracing();
+    postpack_tools::init_tracing();
     let cli = Cli::parse();
 
     let identity = match cli.identity {
         Some(identity) => identity,
-        None => postpack_mock_validator::identity(None, cli.feed.seed)?.pubkey(),
+        None => postpack_tools::identity(None, cli.feed.seed)?.pubkey(),
     };
     let sessions = Arc::new(Sessions::default());
     let searcher = Searcher {

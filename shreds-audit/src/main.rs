@@ -282,7 +282,9 @@ fn main() -> Result<()> {
             }
             if last_draw.elapsed() >= Duration::from_millis(400) {
                 last_draw = Instant::now();
-                t.draw(&live, &registry, txn_snap.as_ref(), &footer)?;
+                let slots: Vec<Option<u64>> =
+                    (0..registry.len() as u16).map(|id| aggregator.latest_slot(id)).collect();
+                t.draw(&live, &registry, &slots, txn_snap.as_ref(), &footer)?;
             }
         } else if last_report.elapsed() >= Duration::from_secs(10) {
             last_report = Instant::now();

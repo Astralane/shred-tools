@@ -121,6 +121,7 @@ pub struct SigRegistry {
     tx_versions: TxVersionCounts,
     contested_total: u64,
     seen: Vec<u64>,
+    latest_slot: Vec<u64>,
     contested: Vec<u64>,
     wins: Vec<u64>,
     behind_sum_ns: Vec<i128>,
@@ -224,6 +225,7 @@ impl SigRegistry {
             tx_versions: TxVersionCounts::default(),
             contested_total: 0,
             seen: vec![0; n],
+            latest_slot: vec![0; n],
             contested: vec![0; n],
             wins: vec![0; n],
             behind_sum_ns: vec![0; n],
@@ -281,6 +283,7 @@ impl SigRegistry {
 
     pub fn record_first(&mut self, sid: usize, sig: [u8; 64], ns: i64, slot: u64, meta: TxnMeta) {
         self.high_slot = self.high_slot.max(slot);
+        self.latest_slot[sid] = self.latest_slot[sid].max(slot);
         // Before the dedupe: the onchain audit must see re-deliveries the race ignores.
         if let Some(index) = &mut self.onchain {
             let vote_not_in_block = self.onchain_omits_votes && meta.is_vote == Some(true);
@@ -420,6 +423,8 @@ impl SigRegistry {
                 let quantile = |q| scored.then(|| hist.value_at_quantile(q) as f64);
                 SourceRaw {
                     seen: self.seen[i],
+                    // 0 means the source never reported a slot.
+                    latest_slot: (self.latest_slot[i] > 0).then_some(self.latest_slot[i]),
                     contested: self.contested[i],
                     wins: self.wins[i],
                     mean_us: scored
@@ -436,6 +441,7 @@ impl SigRegistry {
 #[derive(Clone, Debug, Default)]
 pub struct SourceRaw {
     pub seen: u64,
+    pub latest_slot: Option<u64>,
     pub contested: u64,
     pub wins: u64,
     pub mean_us: Option<f64>,

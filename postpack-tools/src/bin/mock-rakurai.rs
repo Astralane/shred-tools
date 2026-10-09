@@ -16,22 +16,22 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 use tracing::{info, warn};
 
-use postpack_mock_validator::proto::jito::astralane_relayer::astralane_relayer_client::AstralaneRelayerClient;
-use postpack_mock_validator::proto::jito::astralane_relayer::{
+use postpack_tools::proto::jito::astralane_relayer::astralane_relayer_client::AstralaneRelayerClient;
+use postpack_tools::proto::jito::astralane_relayer::{
     ExpiringBundleBatch, RelayUpdate, relay_update,
 };
-use postpack_mock_validator::proto::jito::auth::auth_service_client::AuthServiceClient;
-use postpack_mock_validator::proto::jito::auth::{
+use postpack_tools::proto::jito::auth::auth_service_client::AuthServiceClient;
+use postpack_tools::proto::jito::auth::{
     GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role,
 };
-use postpack_mock_validator::proto::jito::block_engine::block_engine_relayer_client::BlockEngineRelayerClient;
-use postpack_mock_validator::proto::jito::block_engine::{
+use postpack_tools::proto::jito::block_engine::block_engine_relayer_client::BlockEngineRelayerClient;
+use postpack_tools::proto::jito::block_engine::{
     ExpiringPacketBatch, PacketBatchUpdate, StartExpiringPacketStreamResponse, packet_batch_update,
 };
-use postpack_mock_validator::proto::jito::bundle::{Bundle, BundleUuid};
-use postpack_mock_validator::proto::jito::packet::{Meta, Packet, PacketBatch};
-use postpack_mock_validator::proto::jito::shared::Header;
-use postpack_mock_validator::{Batch, Feed, FeedArgs};
+use postpack_tools::proto::jito::bundle::{Bundle, BundleUuid};
+use postpack_tools::proto::jito::packet::{Meta, Packet, PacketBatch};
+use postpack_tools::proto::jito::shared::Header;
+use postpack_tools::{Batch, Feed, FeedArgs};
 
 #[derive(Parser)]
 #[command(name = "mock-rakurai")]
@@ -48,10 +48,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    postpack_mock_validator::init_tracing();
+    postpack_tools::init_tracing();
     let cli = Cli::parse();
 
-    let keypair = postpack_mock_validator::identity(cli.keypair_path.as_deref(), cli.feed.seed)?;
+    let keypair = postpack_tools::identity(cli.keypair_path.as_deref(), cli.feed.seed)?;
     info!(identity = %keypair.pubkey(), url = %cli.url, "authenticating");
 
     let channel = Endpoint::from_str(&cli.url)?
@@ -171,7 +171,7 @@ async fn send_batch(
 
 fn header() -> Header {
     Header {
-        ts: Some(postpack_mock_validator::now()),
+        ts: Some(postpack_tools::now()),
     }
 }
 

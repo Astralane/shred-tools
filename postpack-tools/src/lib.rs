@@ -80,7 +80,11 @@ impl Feed {
                 }));
                 index += 1;
                 if index.is_multiple_of(rate) {
-                    info!(batches = index, subscribers = sender.receiver_count(), "produced");
+                    info!(
+                        batches = index,
+                        subscribers = sender.receiver_count(),
+                        "produced"
+                    );
                 }
             }
         });

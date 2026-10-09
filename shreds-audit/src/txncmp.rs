@@ -232,6 +232,7 @@ fn build_snapshot(
                 name: reg.name(sid).to_string(),
                 kind: reg.kind(sid),
                 seen: raw.seen,
+                latest_slot: raw.latest_slot,
                 contested: raw.contested,
                 winrate: (raw.contested > 0).then(|| raw.wins as f64 / raw.contested as f64),
                 behind_mean_us: raw.mean_us,
