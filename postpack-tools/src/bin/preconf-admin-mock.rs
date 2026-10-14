@@ -38,6 +38,7 @@ const MAX_POSTPACK_PAY_TRANSACTIONS: usize = 1000;
 const PACKET_DATA_SIZE: usize = 1232;
 const CREDITS_PER_CENT: u64 = 2_000;
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+const SLOTS_PER_EPOCH: u64 = 432_000;
 const MAX_OVERRIDE_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_ADMIN_CREDITS_CHANGE: i64 = 1_000_000_000_000;
 const MAX_HOURS: u32 = 7 * 24;
@@ -449,6 +450,74 @@ struct CreditHistoryEntry {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+struct PostpackValidators {
+    #[schema(example = 870)]
+    epoch: Option<i64>,
+    total_epoch_stake_sol: f64,
+    #[schema(example = 432_000)]
+    total_epoch_slots: u64,
+    validators: Vec<PostpackValidator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+struct PostpackValidator {
+    identity: String,
+    name: Option<String>,
+    #[schema(example = "bam")]
+    provider: String,
+    #[schema(example = "10.0.0.1")]
+    source_ip: String,
+    #[schema(example = "agave_bam")]
+    client: Option<String>,
+    #[schema(example = "frankfurt")]
+    region: Option<String>,
+    activated_stake_sol: f64,
+    epoch_leader_slots: i32,
+    #[schema(example = 0.29)]
+    coverage: f64,
+    expected_24h_slots: i32,
+    received_24h_slots: u64,
+    messages_24h: u64,
+    last_seen_at: Option<DateTime<Utc>>,
+    by_relay: Vec<RelayActivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+struct RelayActivity {
+    #[schema(example = "fra")]
+    relay: String,
+    received_24h_slots: u64,
+    messages_24h: u64,
+    last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, PartialEq, Serialize, ToSchema)]
+struct ConnectedStake {
+    epoch: Option<i64>,
+    total_epoch_stake_sol: f64,
+    connected_validators: usize,
+    connected_stake_sol: f64,
+    #[schema(example = 0.1)]
+    connected_stake_share: f64,
+    by_provider: Vec<ProviderStake>,
+    by_region: Vec<RegionStake>,
+}
+
+#[derive(Debug, PartialEq, Serialize, ToSchema)]
+struct ProviderStake {
+    provider: String,
+    validators: usize,
+    stake_sol: f64,
+}
+
+#[derive(Debug, PartialEq, Serialize, ToSchema)]
+struct RegionStake {
+    region: Option<String>,
+    validators: usize,
+    stake_sol: f64,
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct HourlyUsageParams {
@@ -665,6 +734,7 @@ impl Store {
 
 struct App {
     store: RwLock<Store>,
+    validators: PostpackValidators,
     tip_accounts: Vec<Pubkey>,
     sol_price: RwLock<SolPrice>,
 }
@@ -752,11 +822,179 @@ fn seeded(now: DateTime<Utc>) -> Store {
     store
 }
 
+struct SeededValidator {
+    name: Option<&'static str>,
+    client: Option<&'static str>,
+    region: Option<&'static str>,
+    stake_sol: f64,
+    epoch_leader_slots: i32,
+    connections: &'static [(&'static str, &'static str)],
+}
+
+fn seeded_validators(now: DateTime<Utc>) -> PostpackValidators {
+    let validators = [
+        SeededValidator {
+            name: Some("Helius"),
+            client: Some("agave_bam"),
+            region: Some("frankfurt"),
+            stake_sol: 14_200_000.0,
+            epoch_leader_slots: 14_920,
+            connections: &[("bam", "10.0.0.1"), ("rakurai", "10.0.0.2")],
+        },
+        SeededValidator {
+            name: Some("Everstake"),
+            client: Some("everstake_rakurai"),
+            region: Some("amsterdam"),
+            stake_sol: 9_850_000.0,
+            epoch_leader_slots: 10_348,
+            connections: &[("rakurai", "10.0.0.2"), ("rakurai", "10.0.0.3")],
+        },
+        SeededValidator {
+            name: Some("Gravity Blocks"),
+            client: Some("gravity_blocks"),
+            region: Some("new_york"),
+            stake_sol: 3_100_000.0,
+            epoch_leader_slots: 3_256,
+            connections: &[("gravity", "10.0.0.4")],
+        },
+        SeededValidator {
+            name: Some("Tokyo Stake"),
+            client: Some("fire_bam"),
+            region: Some("tokyo"),
+            stake_sol: 1_240_000.0,
+            epoch_leader_slots: 1_304,
+            connections: &[("bam", "10.0.0.1")],
+        },
+        SeededValidator {
+            name: None,
+            client: None,
+            region: None,
+            stake_sol: 0.0,
+            epoch_leader_slots: 0,
+            connections: &[("bam", "10.0.0.1")],
+        },
+    ];
+    let mut listed = Vec::new();
+    for (index, seed) in validators.into_iter().enumerate() {
+        let identity = Pubkey::new_from_array([index as u8 + 1; 32]).to_string();
+        let expected_24h_slots = seed.epoch_leader_slots / 2;
+        for (connection, (provider, source_ip)) in seed.connections.iter().enumerate() {
+            let last_seen_at = Some(now - TimeDelta::seconds((index * 7 + connection) as i64));
+            let by_relay: Vec<RelayActivity> = ["ams", "fra", "ny"]
+                .into_iter()
+                .enumerate()
+                .map(|(relay, name)| {
+                    let received = (expected_24h_slots as u64) * (3 - relay as u64) / 4;
+                    RelayActivity {
+                        relay: name.to_string(),
+                        received_24h_slots: received,
+                        messages_24h: received * 64,
+                        last_seen_at,
+                    }
+                })
+                .filter(|relay| relay.received_24h_slots > 0)
+                .collect();
+            let received_24h_slots = by_relay
+                .iter()
+                .map(|relay| relay.received_24h_slots)
+                .max()
+                .unwrap_or(0);
+            listed.push(PostpackValidator {
+                identity: identity.clone(),
+                name: seed.name.map(str::to_string),
+                provider: provider.to_string(),
+                source_ip: source_ip.to_string(),
+                client: seed.client.map(str::to_string),
+                region: seed.region.map(str::to_string),
+                activated_stake_sol: seed.stake_sol,
+                epoch_leader_slots: seed.epoch_leader_slots,
+                coverage: (f64::from(seed.epoch_leader_slots) * 100.0 / SLOTS_PER_EPOCH as f64
+                    * 100.0)
+                    .round()
+                    / 100.0,
+                expected_24h_slots,
+                received_24h_slots,
+                messages_24h: by_relay.iter().map(|relay| relay.messages_24h).sum(),
+                last_seen_at,
+                by_relay,
+            });
+        }
+    }
+    listed.sort_by(|a, b| {
+        b.activated_stake_sol
+            .total_cmp(&a.activated_stake_sol)
+            .then_with(|| a.identity.cmp(&b.identity))
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.source_ip.cmp(&b.source_ip))
+    });
+    PostpackValidators {
+        epoch: Some(870),
+        total_epoch_stake_sol: 412_500_000.0,
+        total_epoch_slots: SLOTS_PER_EPOCH,
+        validators: listed,
+    }
+}
+
+fn connected_stake(listed: &PostpackValidators) -> ConnectedStake {
+    let mut identities: HashMap<&str, &PostpackValidator> = HashMap::new();
+    let mut by_provider: BTreeMap<&str, HashMap<&str, f64>> = BTreeMap::new();
+    for validator in &listed.validators {
+        identities.entry(&validator.identity).or_insert(validator);
+        by_provider
+            .entry(&validator.provider)
+            .or_default()
+            .insert(&validator.identity, validator.activated_stake_sol);
+    }
+    let mut by_region: HashMap<Option<&str>, (usize, f64)> = HashMap::new();
+    for validator in identities.values() {
+        let region = by_region.entry(validator.region.as_deref()).or_default();
+        region.0 += 1;
+        region.1 += validator.activated_stake_sol;
+    }
+    let mut by_region = by_region
+        .into_iter()
+        .map(|(region, (validators, stake_sol))| RegionStake {
+            region: region.map(str::to_owned),
+            validators,
+            stake_sol,
+        })
+        .collect::<Vec<_>>();
+    by_region.sort_by(|a, b| {
+        b.stake_sol
+            .total_cmp(&a.stake_sol)
+            .then_with(|| a.region.cmp(&b.region))
+    });
+    let connected_stake_sol: f64 = identities
+        .values()
+        .map(|validator| validator.activated_stake_sol)
+        .sum();
+    ConnectedStake {
+        epoch: listed.epoch,
+        total_epoch_stake_sol: listed.total_epoch_stake_sol,
+        connected_validators: identities.len(),
+        connected_stake_sol,
+        connected_stake_share: if listed.total_epoch_stake_sol > 0.0 {
+            connected_stake_sol / listed.total_epoch_stake_sol
+        } else {
+            0.0
+        },
+        by_provider: by_provider
+            .into_iter()
+            .map(|(provider, validators)| ProviderStake {
+                provider: provider.to_owned(),
+                validators: validators.len(),
+                stake_sol: validators.values().sum(),
+            })
+            .collect(),
+        by_region,
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "Preconf admin API",
-        description = "In-memory mock of the admin-server postpack endpoints and the public-server /postpack-pay endpoint. Known API keys: demo-key-tier1 (paying, with 48 hours of seeded usage), demo-key-trial (tier override), demo-key-off, demo-key-new (not a postpack client yet)."
+        description = "In-memory mock of the admin-server postpack endpoints and the public-server /postpack-pay endpoint. Known API keys: demo-key-tier1 (paying, with 48 hours of seeded usage), demo-key-trial (tier override), demo-key-off, demo-key-new (not a postpack client yet). The validators are a fixed seeded list."
     ),
     paths(
         get_all_postpack_clients,
@@ -772,6 +1010,8 @@ fn seeded(now: DateTime<Utc>) -> Store {
         get_hourly_usage,
         get_daily_usage,
         get_credit_history,
+        get_validators,
+        get_connected_stake,
         postpack_pay
     )
 )]
@@ -809,6 +1049,8 @@ fn router(db: Db) -> Router {
             "/admin/postpack/{key}/credits/history",
             get(get_credit_history),
         )
+        .route("/admin/postpack/validators", get(get_validators))
+        .route("/admin/postpack/validators/stake", get(get_connected_stake))
         .route("/postpack-pay", post(postpack_pay))
         .with_state(db)
 }
@@ -1221,6 +1463,30 @@ async fn get_credit_history(
 }
 
 #[utoipa::path(
+    get,
+    path = "/admin/postpack/validators",
+    tag = "validators",
+    summary = "Validators sending post-pack messages over the last 24 hours",
+    description = "One row per validator and provider source IP, by stake. Stake, leader slots, coverage and expected slots come from the leader schedule and are 0 for a validator outside it.",
+    responses((status = 200, body = PostpackValidators))
+)]
+async fn get_validators(State(db): State<Db>) -> Json<PostpackValidators> {
+    Json(db.validators.clone())
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/postpack/validators/stake",
+    tag = "validators",
+    summary = "Connected stake overall, per provider and per region",
+    description = "Each validator counts once overall, once per provider and once per region.",
+    responses((status = 200, body = ConnectedStake))
+)]
+async fn get_connected_stake(State(db): State<Db>) -> Json<ConnectedStake> {
+    Json(connected_stake(&db.validators))
+}
+
+#[utoipa::path(
     post,
     path = "/postpack-pay",
     tag = "public server",
@@ -1496,6 +1762,7 @@ async fn main() {
     let now = Utc::now();
     let db = Arc::new(App {
         store: RwLock::new(seeded(now)),
+        validators: seeded_validators(now),
         tip_accounts,
         sol_price: RwLock::new(SolPrice {
             cents: sol_usd_price_cents,
@@ -1561,8 +1828,10 @@ mod tests {
     }
 
     fn app_priced(price: SolPrice) -> Db {
+        let now = Utc::now();
         Arc::new(App {
-            store: RwLock::new(seeded(Utc::now())),
+            store: RwLock::new(seeded(now)),
+            validators: seeded_validators(now),
             tip_accounts: vec![tip_account()],
             sol_price: RwLock::new(price),
         })
@@ -2205,5 +2474,65 @@ mod tests {
         for account in DEFAULT_TIP_ACCOUNTS {
             Pubkey::from_str(account).unwrap();
         }
+    }
+
+    #[test]
+    fn seeded_validators_are_listed_by_stake() {
+        let listed = seeded_validators(Utc::now());
+        assert!(
+            listed
+                .validators
+                .windows(2)
+                .all(|pair| pair[0].activated_stake_sol >= pair[1].activated_stake_sol)
+        );
+        let helius = &listed.validators[0];
+        assert_eq!(helius.name.as_deref(), Some("Helius"));
+        assert_eq!(helius.coverage, 3.45);
+        assert!(helius.received_24h_slots <= helius.expected_24h_slots as u64);
+        let untracked = listed.validators.last().unwrap();
+        assert_eq!(untracked.name, None);
+        assert_eq!(untracked.coverage, 0.0);
+        assert!(untracked.by_relay.is_empty());
+    }
+
+    #[test]
+    fn connected_stake_counts_each_validator_once_overall_per_provider_and_per_region() {
+        let stake = connected_stake(&seeded_validators(Utc::now()));
+        assert_eq!(stake.connected_validators, 5);
+        assert_eq!(stake.connected_stake_sol, 28_390_000.0);
+        assert_eq!(
+            stake
+                .by_provider
+                .iter()
+                .map(|provider| (
+                    provider.provider.as_str(),
+                    provider.validators,
+                    provider.stake_sol
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("bam", 3, 15_440_000.0),
+                ("gravity", 1, 3_100_000.0),
+                ("rakurai", 2, 24_050_000.0),
+            ]
+        );
+        assert_eq!(stake.by_region[0].region.as_deref(), Some("frankfurt"));
+        assert_eq!(
+            stake
+                .by_region
+                .iter()
+                .map(|region| region.validators)
+                .sum::<usize>(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn validators_are_served_from_the_seed() {
+        let app = app();
+        let Json(listed) = get_validators(State(app.clone())).await;
+        assert_eq!(listed.validators.len(), 7);
+        let Json(stake) = get_connected_stake(State(app)).await;
+        assert_eq!(stake.epoch, Some(870));
     }
 }

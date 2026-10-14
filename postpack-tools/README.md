@@ -91,7 +91,8 @@ An in-memory mock of the txn-router admin-server post-pack API and the public se
 `/postpack-pay`, with the same routes, bodies, validation and error messages. Swagger UI is
 served at `/swagger-ui`. It is seeded with `demo-key-tier1` (paying, 48 hours of usage on
 two relay instances), `demo-key-trial` (tier override), `demo-key-off` and `demo-key-new`
-(an API key that is not a post-pack client yet).
+(an API key that is not a post-pack client yet). The validators are a fixed list of five,
+two of them connected through more than one provider IP and one outside the leader schedule.
 
 | route | |
 |---|---|
@@ -106,6 +107,8 @@ two relay instances), `demo-key-trial` (tier override), `demo-key-off` and `demo
 | `GET /admin/postpack/{key}/credits/history?before_id=&limit=` | balance changes other than usage |
 | `GET`, `PUT /admin/postpack/credits/settings` | `credits_enabled`, prices per message type and unit |
 | `GET /admin/postpack/credits/price?lamports=` | quote, 503 when the SOL price is older than 30 minutes |
+| `GET /admin/postpack/validators` | validators sending post-pack messages, per provider source IP |
+| `GET /admin/postpack/validators/stake` | connected stake overall, per provider and per region |
 | `POST /postpack-pay?api-key=` | register tip transactions |
 
 The mock treats every accepted `/postpack-pay` transaction as landed and, once the key is a
