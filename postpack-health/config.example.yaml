@@ -1,0 +1,46 @@
+# postpack-health config. Copy to config.yaml and run:
+#   ./postpack-health --config-path config.yaml
+
+# ClickHouse holding shred_indexer.*. Use the Terra indexer: it is NVMe-backed and
+# is where the live indexer writes, so the join runs in ~1.5s. The new-longhorn XL
+# cluster also holds these tables but is JBOD spinning disk, where the same query
+# takes 16-25s, and its copy of the limburg data stopped on 2026-08-23.
+clickhouse:
+  url: "http://100.95.71.49:18123/"
+  user: "bi_readonly"
+  password: ""
+  database: "shred_indexer"
+
+# Incoming webhook for the channel that should receive degradation alerts.
+slack_webhook: "https://hooks.slack.com/services/..."
+
+# Which indexer host to measure. Both sides of the race are stamped by this
+# host's clock, so the comparison is free of skew. Omit to use every host.
+shred_host: "limburg"
+
+# Postpack endpoints the indexer subscribes to. Omit for all of them.
+endpoints:
+  - "185.191.117.97:30001"
+
+# ---------------------------------------------------------------------------
+# Optional — defaults shown.
+# ---------------------------------------------------------------------------
+#
+# poll_interval_secs: 180     # how often to evaluate. The window is 15 minutes, so
+#                             # polling faster buys nothing and only adds disk load.
+# window_secs: 900            # width of the evaluated window
+# window_offset_secs: 300     # how far behind now the window ends, so that
+#                             # transactions have had time to land
+# land_lookahead_secs: 120    # how far past the window to look for the shred
+#                             # range carrying a transaction
+# min_pairs: 100              # below this many matched pairs the verdict is
+#                             # withheld rather than drawn from a few samples
+# win_rate_threshold: 0.85    # breach below this share of postpack-first txns
+# recovery_win_rate: 0.90     # recovery is announced at or above this
+# late_ms_threshold: 100      # a transaction this far behind shreds is "late"
+# late_rate_threshold: 0.10   # breach above this share of late transactions
+# recovery_late_rate: 0.08    # recovery also requires the late rate at or below
+#                             # this, so a tail-lag breach cannot clear on jitter
+# repeat_alert_secs: 900      # while degraded, repeat at most this often
+# no_data_alert_after_secs: 1800  # alert if the window stays empty this long
+# query_timeout_secs: 60
