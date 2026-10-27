@@ -770,6 +770,7 @@ fn seeded(now: DateTime<Utc>) -> Store {
         ]
         .into_iter()
         .map(str::to_string)
+        .chain((5..=10).map(|n| format!("demo-key-{n}")))
         .collect(),
         ..Store::default()
     };
@@ -994,7 +995,7 @@ fn connected_stake(listed: &PostpackValidators) -> ConnectedStake {
 #[openapi(
     info(
         title = "Preconf admin API",
-        description = "In-memory mock of the admin-server postpack endpoints and the public-server /postpack-pay endpoint. Known API keys: demo-key-tier1 (paying, with 48 hours of seeded usage), demo-key-trial (tier override), demo-key-off, demo-key-new (not a postpack client yet). The validators are a fixed seeded list."
+        description = "In-memory mock of the admin-server postpack endpoints and the public-server /postpack-pay endpoint. Known API keys: demo-key-tier1 (paying, with 48 hours of seeded usage), demo-key-trial (tier override), demo-key-off, demo-key-new and demo-key-5 to demo-key-10 (not postpack clients yet). The validators are a fixed seeded list."
     ),
     paths(
         get_all_postpack_clients,

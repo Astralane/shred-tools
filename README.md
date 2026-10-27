@@ -19,6 +19,10 @@ Tooling for measuring and monitoring Solana shred-source performance.
   BAM and Gravity providers for `postpack-relay`, an in-memory preconf admin API mock
   with `/postpack-pay`, and a generator of fake signed tip transactions for it.
 
+- **[`deshred-example/`](deshred-example/)** - A minimal gRPC client for the
+  Decoded Shreds service: subscribe with account filters and stream decoded
+  transactions.
+
 - **[`shreds-example/`](shreds-example/)** - A small, standalone example client that reacts to Solana shreds forwarded by shreds-hub.
 
 See each subdirectory's README for usage.

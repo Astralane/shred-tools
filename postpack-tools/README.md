@@ -90,8 +90,8 @@ cargo run --bin preconf-admin-mock -- 127.0.0.1:28090
 An in-memory mock of the txn-router admin-server post-pack API and the public server's
 `/postpack-pay`, with the same routes, bodies, validation and error messages. Swagger UI is
 served at `/swagger-ui`. It is seeded with `demo-key-tier1` (paying, 48 hours of usage on
-two relay instances), `demo-key-trial` (tier override), `demo-key-off` and `demo-key-new`
-(an API key that is not a post-pack client yet). The validators are a fixed list of five,
+two relay instances), `demo-key-trial` (tier override), `demo-key-off`, and `demo-key-new`
+plus `demo-key-5` to `demo-key-10` (API keys that are not post-pack clients yet). The validators are a fixed list of five,
 two of them connected through more than one provider IP and one outside the leader schedule.
 
 | route | |
