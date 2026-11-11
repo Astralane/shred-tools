@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+// Note: This schema is derived from the harmonic-preconf-example repository:
+// https://github.com/rpcpool/harmonic-preconf-example/blob/master/protos/preconf.proto
+
+package preconf;
+
+service PreconfAuthService {
+  rpc GenerateAuthChallenge(GenerateAuthChallengeRequest) returns (GenerateAuthChallengeResponse);
+  rpc GenerateAuthTokens(GenerateAuthTokensRequest) returns (GenerateAuthTokensResponse);
+}
+
+service PreconfService {
+  rpc SubscribePreconfs(SubscribePreconfsRequest) returns (stream PreconfStreamMessage);
+}
+
+message GenerateAuthChallengeRequest {
+  bytes pubkey = 1;
+}
+
+message GenerateAuthChallengeResponse {
+  bytes challenge = 1;
+}
+
+message GenerateAuthTokensRequest {
+  bytes pubkey = 1;
+  bytes challenge = 2;
+  bytes signature = 3;
+}
+
+message Token {
+  string value = 1;
+  int64 expires_at_ms = 2;
+}
+
+message GenerateAuthTokensResponse {
+  Token access_token = 1;
+}
+
+message SubscribePreconfsRequest {
+  repeated bytes accounts_of_interest = 1;
+  repeated bytes programs_of_interest = 2;
+  // Withholds a matched transaction that references any of these accounts.
+  repeated bytes excluded_accounts = 3;
+}
+
+message ValidatorSlotStart {
+  bytes leader_address = 1;
+  uint64 slot = 2;
+  // Nanoseconds since the unix epoch.
+  uint64 server_side_timestamp = 3;
+}
+
+message Preconf {
+  uint64 slot = 1;
+  // Raw serialized Solana transaction.
+  bytes data = 2;
+}
+
+message PreconfStreamMessage {
+  oneof message {
+    ValidatorSlotStart validator_slot_start = 1;
+    Preconf preconf = 2;
+  }
+}
+

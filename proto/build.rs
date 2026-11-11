@@ -3,6 +3,7 @@ use std::{env, path::PathBuf};
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=geyser.proto");
     println!("cargo:rerun-if-changed=solana-storage.proto");
+    println!("cargo:rerun-if-changed=preconf.proto");
     println!("cargo:rerun-if-changed=yellowstone");
 
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
@@ -15,8 +16,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let include_dir = include_path.to_string_lossy().into_owned();
 
-    tonic_prost_build::configure()
-        .compile_protos(&["geyser.proto", "solana-storage.proto"], &[".", &include_dir])?;
+    tonic_prost_build::configure().compile_protos(
+        &["geyser.proto", "solana-storage.proto", "preconf.proto"],
+        &[".", &include_dir],
+    )?;
 
     let yellowstone_out = out_dir.join("yellowstone");
     std::fs::create_dir_all(&yellowstone_out)?;

@@ -10,6 +10,10 @@ pub mod geyser {
     tonic::include_proto!("geyser");
 }
 
+pub mod preconf {
+    tonic::include_proto!("preconf");
+}
+
 #[allow(clippy::all, non_camel_case_types, non_snake_case, dead_code)]
 pub mod yellowstone {
     pub mod solana {

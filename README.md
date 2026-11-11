@@ -23,6 +23,10 @@ Tooling for measuring and monitoring Solana shred-source performance.
   Decoded Shreds service: subscribe with account filters and stream decoded
   transactions.
 
+- **[`postpack-example/`](postpack-example/)** - A minimal gRPC client for the
+  post-pack relay: subscribe with account, program and exclusion filters and stream
+  packed transactions.
+
 - **[`shreds-example/`](shreds-example/)** - A small, standalone example client that reacts to Solana shreds forwarded by shreds-hub.
 
 See each subdirectory's README for usage.
